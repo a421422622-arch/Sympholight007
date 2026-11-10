@@ -1400,6 +1400,18 @@ window.addEventListener("beforeunload", event => {
   if (state.dirty) { event.preventDefault(); event.returnValue = ""; }
 });
 
+const localClock = $("localClock");
+const clockFormat = new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+});
+function updateLocalClock() {
+  const time = clockFormat.format(new Date());
+  localClock.textContent = time;
+  localClock.dateTime = time;
+}
+updateLocalClock();
+setInterval(updateLocalClock, 1000);
+
 async function start() {
   try {
     applyAccess(await request("/access"));
