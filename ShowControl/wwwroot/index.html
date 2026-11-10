@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101615">
+  <title>灯控编排台</title>
+  <link rel="stylesheet" href="/workbench.css">
+  <script src="/workbench.js" defer></script>
+</head>
+<body>
+  <header class="top" id="appTop">
+    <div class="identity"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span><div><strong>灯控编排台</strong><span>SHOW CONTROL / 本地工作站</span></div></div>
+    <div class="top-project"><span class="eyebrow">当前项目</span><button id="projectName" class="row-select" data-action="rename-project" type="button">正在连接…</button></div>
+    <div class="top-actions"><span id="mode" class="mode"><i></i>连接中</span>
+      <button id="resetLayout" class="button quiet admin-only" type="button">恢复默认布局</button>
+      <button id="permissions" class="button quiet admin-only" type="button">权限</button>
+      <button id="udpAdapter" class="button quiet admin-only" type="button">UDP 网卡</button>
+      <button id="lock" class="button quiet" type="button">锁屏</button>
+      <button id="stop" type="button" class="button danger" disabled>■ 全部停止</button>
+      <button id="reload" class="button quiet" type="button">重新载入</button><button id="save" class="button strong admin-only" type="button" disabled>保存项目</button></div>
+  </header>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <main class="workbench" id="panelGrid">
+    <aside class="sidebar" data-panel="project" aria-label="项目导航"><div class="panel-body">
+      <div class="side-head"><div><span class="eyebrow">01 / 导航</span><h2>项目结构</h2></div>
+        <button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动项目结构面板" title="拖动到另一面板，或按左右方向键">⠿</button>
+        <button class="icon admin-only" id="addShow" type="button" title="新增演出" aria-label="新增演出">＋</button></div>
+      <div class="tree-tools"><input id="projectSearch" type="search" placeholder="搜索演出、列表或 Cue" aria-label="搜索项目结构">
+        <div class="pager" id="treePager"></div></div>
+      <nav id="tree" class="tree" aria-label="项目树"></nav>
+      <div class="resources"><span class="eyebrow">全局资源 · 所有演出共享</span>
+        <button type="button" data-tab="ips"><span>▦</span> IP 分组库 <b id="ipCount"></b></button>
+        <button type="button" data-tab="templates"><span>▤</span> 模板库 <b id="templateCount"></b></button>
+      </div>
+    </div><button type="button" class="panel-resizer admin-only" aria-label="调整项目结构面板尺寸" title="拖动调整宽高，或用方向键">◢</button></aside>
+    <section class="workspace" data-panel="workspace" aria-label="编排工作区"><div class="panel-body">
+      <nav class="tabs" id="tabs" aria-label="工作区标签">
+        <button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动编排面板" title="拖动到另一面板，或按左右方向键">⠿</button>
+        <button type="button" data-tab="cues">Cue 编排</button><button type="button" data-tab="schedules">定时任务</button>
+        <button type="button" data-tab="pads">Action Pad</button><button type="button" data-tab="health">节点看板</button>
+      </nav>
+      <div id="main"></div>
+    </div><button type="button" class="panel-resizer admin-only" aria-label="调整编排面板尺寸" title="拖动调整宽高，或用方向键">◢</button></section>
+    <aside class="properties-panel" id="propertiesPanel" data-panel="properties" aria-label="Cue 属性"><div class="panel-body">
+      <button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动 Cue 属性面板" title="拖动到另一面板，或按左右方向键">⠿</button><div id="properties" class="properties"></div>
+    </div><button type="button" class="panel-resizer admin-only" aria-label="调整属性面板尺寸" title="拖动调整宽高，或用方向键">◢</button></aside>
+    <section class="log dock-wide" data-panel="log" aria-labelledby="logTitle"><div class="panel-body">
+      <header class="log-head"><div><button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动日志面板" title="拖动到另一面板，或按左右方向键">⠿</button><span class="eyebrow">03 / 执行</span><h2 id="logTitle">执行日志</h2></div><span id="active" class="run-state">引擎待命</span><button id="logFolder" type="button" class="button quiet">日志文件夹</button></header>
+      <p id="logStorageWarning" class="badge warn" hidden>日志写入异常。请查看日志文件夹状态。</p>
+      <div class="scroll log-body"><table><thead><tr><th>时间</th><th>触发</th><th>Cue 列表 / Cue</th><th>状态</th><th>详情</th></tr></thead><tbody id="logs"><tr><td colspan="5">等待首条执行记录</td></tr></tbody></table></div>
+    </div><button type="button" class="panel-resizer admin-only" aria-label="调整日志面板尺寸" title="拖动调整宽高，或用方向键">◢</button></section>
+  </main>
+  <section id="lockScreen" class="lock-screen" hidden aria-labelledby="lockTitle">
+    <form id="unlockForm" class="lock-card">
+      <h1 id="lockTitle">灯控编排台已锁屏</h1><p id="lockStatus">引擎继续运行。</p>
+      <label class="field"><span>角色</span><select name="role"><option value="admin">管理员</option><option value="operator">操作员</option></select></label>
+      <label class="field"><span>密码</span><input name="password" type="password" maxlength="128" autocomplete="current-password" required></label>
+      <p id="unlockError" role="alert"></p><button class="button strong" type="submit">解锁</button>
+    </form>
+  </section>
+  <input id="ipImportFile" type="file" accept=".xlsx,.txt" hidden>
+  <dialog id="logFolderDialog">
+    <form method="dialog">
+      <header><h2>执行日志文件夹</h2></header>
+      <div class="log-folder-fields"><label class="field"><span>文件夹路径</span><input id="logFolderPath" readonly></label>
+        <p>日志按日期追加写入 TXT，重启后继续写入当天文件。</p><p id="logFolderError" class="form-error"></p></div>
+      <footer><button class="button strong">关闭</button></footer>
+    </form>
+  </dialog>
+  <dialog id="editor">
+    <form id="editForm"><header><div><span class="eyebrow">项目编辑</span><h2 id="editTitle"></h2></div><button id="closeEditor" type="button" class="icon" aria-label="关闭">×</button></header>
+      <div id="fields"></div><p id="formError" class="form-error" role="alert"></p>
+      <footer><button type="button" id="cancelEdit" class="button quiet">取消</button><button type="submit" class="button strong">应用</button></footer>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,13 @@
+**/bin/
+**/obj/
+**/data/
+**/logs/
+dist/
+.tools/
+.vs/
+*.user
+*.log
+*.zip
+**/project.json
+**/access.json
+**/layout.json

@@ -1,0 +1,7 @@
+{
+  "name": "showcontrol-desktop",
+  "productName": "ShowControlDesktop",
+  "version": "1.6.1",
+  "private": true,
+  "main": "main.cjs"
+}
