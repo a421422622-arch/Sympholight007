@@ -1,16 +1,23 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
 
 namespace ShowControl;
 
 internal sealed record LogFolderStatus(string Directory, long LostEntries, string? Error);
+internal sealed record LogViewSettings(int MaxRows = 300);
+internal sealed record LogView(string Version, int MaxRows, EventEntry[]? Events);
 
 internal sealed class ExecutionLogStore(string dataDirectory) : BackgroundService
 {
     private readonly object recentGate = new();
+    private readonly object settingsGate = new();
     private readonly Queue<EventEntry> recent = new();
-    public EventEntry[] Recent { get { lock (recentGate) return recent.Reverse().ToArray(); } }
+    private readonly string viewId = Guid.NewGuid().ToString("N");
+    private long viewRevision;
+    private int maxRows = LoadMaxRows(Path.Combine(dataDirectory, "log-view.json"));
+    private readonly string viewPath = Path.Combine(dataDirectory, "log-view.json");
     private readonly string folder = Path.GetFullPath(Path.Combine(dataDirectory, "logs"));
     private readonly Channel<EventEntry> queue = Channel.CreateBounded<EventEntry>(new BoundedChannelOptions(8192)
     {
@@ -22,12 +29,46 @@ internal sealed class ExecutionLogStore(string dataDirectory) : BackgroundServic
 
     public LogFolderStatus Status => new(folder, Interlocked.Read(ref lostEntries), Volatile.Read(ref error));
 
+    public LogView View(string? knownVersion)
+    {
+        lock (recentGate)
+        {
+            var version = $"{viewId}:{viewRevision}";
+            return new(version, maxRows, version == knownVersion ? null : recent.Reverse().ToArray());
+        }
+    }
+
+    public void SetViewSettings(LogViewSettings settings)
+    {
+        if (settings.MaxRows is < 1 or > 2000) throw new ArgumentException("日志最大行数须为 1–2000。");
+        lock (settingsGate)
+        {
+            ProjectStore.SaveFile(viewPath, settings);
+            lock (recentGate)
+            {
+                maxRows = settings.MaxRows;
+                while (recent.Count > maxRows) recent.Dequeue();
+                viewRevision++;
+            }
+        }
+    }
+
+    public void ClearView()
+    {
+        lock (recentGate)
+        {
+            recent.Clear();
+            viewRevision++;
+        }
+    }
+
     public void Append(EventEntry entry)
     {
         lock (recentGate)
         {
-            if (recent.Count >= 300) recent.Dequeue();
+            if (recent.Count >= maxRows) recent.Dequeue();
             recent.Enqueue(entry);
+            viewRevision++;
         }
         if (!queue.Writer.TryWrite(entry))
             Interlocked.Increment(ref lostEntries);
@@ -83,6 +124,17 @@ internal sealed class ExecutionLogStore(string dataDirectory) : BackgroundServic
     private static string Format(EventEntry entry) => string.Join('\t',
         new[] { entry.At.ToString("O", CultureInfo.InvariantCulture), entry.Source, entry.List, entry.Cue, entry.Status, entry.Message }
         .Select(value => value.Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\r", "\\r").Replace("\n", "\\n")));
+
+    private static int LoadMaxRows(string path)
+    {
+        try
+        {
+            if (JsonSerializer.Deserialize<LogViewSettings>(File.ReadAllBytes(path), JsonSerializerOptions.Web) is { MaxRows: >= 1 and <= 2000 } settings)
+                return settings.MaxRows;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException) { }
+        return new LogViewSettings().MaxRows;
+    }
 }
 
 internal sealed class CueShutdown(CueEngine engine) : IHostedService

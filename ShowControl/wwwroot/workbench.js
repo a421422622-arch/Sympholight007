@@ -27,6 +27,7 @@ const eventLabels = {
   completed: "完成", completedWithSkips: "完成 · 有跳过", receive: "收到数据", deviceWait: "节点排队"
 };
 const state = {
+  logVersion: null, logMaxRows: 300, logCount: 0, clearingLogs: false,
   project: null, revision: 0, dirty: false, tab: "cues", listId: null, cueId: null,
   health: [], filters: { search: "", group: "", status: "" }, runs: [], timezone: "", scheduleMode: "weekly",
   editor: null, saving: false, editCounter: 0, stoppingRuns: new Set(), stoppingAll: false,
@@ -1339,7 +1340,7 @@ async function poll() {
   const version = ++statusRequest;
   let data;
   try {
-    data = await request("/status");
+    data = await request(state.logVersion ? "/status?logVersion=" + encodeURIComponent(state.logVersion) : "/status");
   } catch (error) {
     if (version === statusRequest) {
       state.countdowns.clear();
@@ -1379,11 +1380,17 @@ async function poll() {
   $("mode").classList.toggle("live", data.live);
   $("mode").innerHTML = data.live ? "<i></i>真实 UDP" : "<i></i>模拟模式";
   updateTransport();
+  state.logVersion = data.logVersion ?? null;
+  state.logMaxRows = data.logMaxRows ?? state.logMaxRows;
+  if (!Array.isArray(data.events)) return;
+  state.logCount = data.events.length;
+  $("logRows").textContent = `${state.logCount} / ${state.logMaxRows} 行`;
+  $("clearLogs").disabled = state.clearingLogs || !state.logCount;
   $("logs").innerHTML = data.events.map(event => `<tr><td class="mono">${esc(new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false }))}</td>
     <td>${esc(sourceLabels[event.source] ?? event.source)}</td><td>${esc([event.list, event.cue].filter(Boolean).join(" / "))}</td>
     <td>${badge(eventLabels[event.status] ?? event.status, ["success", "ack", "completed"].includes(event.status) ? "good" :
       ["failed", "stopped"].includes(event.status) ? "bad" : ["retry", "skipped", "priority", "adapterWait"].includes(event.status) ? "warn" : "")}</td><td class="log-detail">${esc(event.message)}</td></tr>`).join("") ||
-    '<tr><td colspan="5">等待首条执行记录</td></tr>';
+    '<tr><td colspan="5">暂无日志</td></tr>';
 }
 
 document.addEventListener("click", async event => {
@@ -1549,6 +1556,28 @@ $("logFolder").addEventListener("click", async () => {
     $("logFolderDialog").showModal();
   }
   catch (error) { notice(error.message, true); }
+});
+$("logSettings").addEventListener("click", () => {
+  if (state.access.role !== "admin") return;
+  edit("日志设置", field("列表最大行数", "maxRows", state.logMaxRows,
+    { type: "number", min: 1, max: 2000, step: 1, required: true }), async data => {
+    await request("/log-view", "PUT", { maxRows: Number(data.get("maxRows")) });
+    await poll();
+  }, null, false);
+});
+$("clearLogs").addEventListener("click", async () => {
+  if (state.access.role !== "admin" || state.clearingLogs || !state.logCount ||
+      !confirm("清空当前日志列表？已保存的 TXT 可在日志文件夹查看。")) return;
+  state.clearingLogs = true;
+  $("clearLogs").disabled = true;
+  try {
+    await request("/log-view/clear", "POST");
+    await poll();
+  } catch (error) { notice(error.message, true); }
+  finally {
+    state.clearingLogs = false;
+    $("clearLogs").disabled = !state.logCount;
+  }
 });
 $("permissions").addEventListener("click", () => { if (state.access.role === "admin") editPermissions(); });
 $("udpAdapter").addEventListener("click", async () => {

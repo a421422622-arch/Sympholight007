@@ -73,6 +73,7 @@ app.Use(async (context, next) =>
     {
         var role = context.RequestServices.GetRequiredService<AccessControl>().View(SessionToken(context)).Role;
         var adminOnly = context.Request.Path.StartsWithSegments("/api/ip-library") ||
+            context.Request.Path.StartsWithSegments("/api/log-view") ||
             context.Request.Path.StartsWithSegments("/api/project/configuration") ||
             context.Request.Path.StartsWithSegments("/api/project/history") ||
             (HttpMethods.IsPut(context.Request.Method) && (context.Request.Path.StartsWithSegments("/api/project") ||
@@ -117,6 +118,20 @@ api.MapPost("/access/lock", (HttpContext context, AccessControl access) =>
 });
 api.MapGet("/layout", (WorkspaceLayout layout) => layout.Get());
 api.MapGet("/log-folder", (ExecutionLogStore logs) => logs.Status);
+api.MapPut("/log-view", (LogViewSettings settings, ExecutionLogStore logs) =>
+{
+    try { logs.SetViewSettings(settings); return Results.NoContent(); }
+    catch (ArgumentException error) { return Results.BadRequest(new { message = error.Message }); }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        return Results.Json(new { message = "日志设置保存失败，请检查数据目录。" }, statusCode: 500);
+    }
+});
+api.MapPost("/log-view/clear", (ExecutionLogStore logs) =>
+{
+    logs.ClearView();
+    return Results.NoContent();
+});
 api.MapGet("/udp-interfaces", (ProjectStore store) => UdpNetwork.Interfaces(store.Get().Project));
 api.MapPut("/layout", (WorkspaceLayout layout, JsonElement data) =>
 {
@@ -183,16 +198,18 @@ api.MapPut("/project", (Snapshot edit, ProjectStore store) =>
         return Results.BadRequest(new { message = error.Message });
     }
 });
-api.MapGet("/status", (HttpContext context, CueEngine engine, RuntimeOptions settings, ProjectStore store, AccessControl access,
+api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine, RuntimeOptions settings, ProjectStore store, AccessControl access,
     NodeHealth health, ExecutionLogStore logs, UdpTransport transport, ScheduleJournal schedule) =>
 {
-    var state = engine.Status();
+    var active = engine.Status();
     var priority = ScheduleCalendar.ActivePriority(store.Get().Project, DateOnly.FromDateTime(DateTime.Now));
     var view = access.View(SessionToken(context));
-    var runs = view.Role is null ? [] : state.Runs;
+    var runs = view.Role is null ? [] : active;
+    var logView = view.Role is null ? null : logs.View(logVersion);
     var logStatus = logs.Status;
     return new { settings.Live, Active = runs.FirstOrDefault(), Runs = runs,
-        Events = view.Role is null ? [] : state.Events, ActiveCount = state.Runs.Length,
+        Events = logView is null ? [] : logView.Events, ActiveCount = active.Length,
+        LogVersion = logView?.Version, LogMaxRows = logView?.MaxRows,
         ReceiptVersion = view.Role is null ? 0 : transport.Version,
         ProjectRecovery = view.Role is not null && store.RequiresRecovery,
         ScheduleStatus = view.Role is null ? null : schedule.Status,

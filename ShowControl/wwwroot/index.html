@@ -51,7 +51,14 @@
       <button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动 Cue 属性面板" title="拖动到另一面板，或按左右方向键">⠿</button><div id="properties" class="properties"></div>
     </div><button type="button" class="panel-resizer admin-only" aria-label="调整属性面板尺寸" title="拖动调整宽高，或用方向键">◢</button></aside>
     <section class="log dock-wide" data-panel="log" aria-labelledby="logTitle"><div class="panel-body">
-      <header class="log-head"><div><button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动日志面板" title="拖动到另一面板，或按左右方向键">⠿</button><span class="eyebrow">03 / 执行</span><h2 id="logTitle">执行日志</h2></div><span id="active" class="run-state">引擎待命</span><button id="logFolder" type="button" class="button quiet">日志文件夹</button></header>
+      <header class="log-head">
+        <div><button class="dock-handle admin-only" type="button" draggable="true" aria-label="移动日志面板" title="拖动到另一面板，或按左右方向键">⠿</button><span class="eyebrow">03 / 执行</span><h2 id="logTitle">执行日志</h2></div>
+        <span id="logRows" class="log-count" title="当前行数 / 最大行数">0 / 300 行</span>
+        <span id="active" class="run-state">引擎待命</span>
+        <button id="logSettings" type="button" class="button quiet admin-only">日志设置</button>
+        <button id="clearLogs" type="button" class="button quiet admin-only" disabled>清空列表</button>
+        <button id="logFolder" type="button" class="button quiet">日志文件夹</button>
+      </header>
       <p id="logStorageWarning" class="badge warn" hidden>日志写入异常。请查看日志文件夹状态。</p>
       <div class="scroll log-body"><table><thead><tr><th>时间</th><th>触发</th><th>Cue 列表 / Cue</th><th>状态</th><th>详情</th></tr></thead><tbody id="logs"><tr><td colspan="5">等待首条执行记录</td></tr></tbody></table></div>
     </div><button type="button" class="panel-resizer admin-only" aria-label="调整日志面板尺寸" title="拖动调整宽高，或用方向键">◢</button></section>

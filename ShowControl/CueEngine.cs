@@ -23,7 +23,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
     private readonly Dictionary<string, Run> active = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim udpSlots = new(512);
 
-    public (ActiveRun[] Runs, EventEntry[] Events) Status()
+    public ActiveRun[] Status()
     {
         lock (gate)
         {
@@ -36,7 +36,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
                     : null;
                 return info with { Stopping = stopping, RemainingWaitMs = remaining };
             }).OrderBy(run => run.At).ToArray();
-            return (runs, logStore.Recent);
+            return runs;
         }
     }
 
