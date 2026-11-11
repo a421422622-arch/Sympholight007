@@ -14,7 +14,7 @@ const packetEncodings = [...stringEncodings.map(([id, name]) => [id, "String · 
 const defaultLayout = { order: ["project", "workspace", "properties", "log"], sizes: {} };
 const adminActions = new Set(["rename-project", "edit-show", "add-group", "edit-group", "add-list", "edit-list",
   "add-cue", "add-target", "remove-target", "delete-cue", "up", "down", "edit-resource", "delete-resource",
-  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "cue-node-override"]);
+  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "cue-node-override", "project-export", "project-import", "project-restore"]);
 const scheduleModes = { weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
 const weekdays = [[1, "一"], [2, "二"], [3, "三"], [4, "四"], [5, "五"], [6, "六"], [0, "日"]];
 const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务", health: "软件检测", udp: "UDP 回传" };
@@ -397,6 +397,7 @@ async function editUdpAdapter() {
     '<button type="button" class="button quiet" data-remove-route>移除</button></div>';
   edit("UDP 网卡与网段",
     table(["当前本机网卡", "地址", "状态"], adapters.map(adapter => `<tr><td>${esc(adapter.name)}</td><td>${esc(adapter.addresses.join(" / ") || "—")}</td><td>${adapter.up && adapter.addresses.length ? "可用" : "未就绪"}</td></tr>`).join("")) +
+    field("网卡等待上限 (s)", "adapterWaitSeconds", state.project.adapterWaitSeconds ?? 15, { type: "number", min: 1, max: 300, required: true }) +
     field("未匹配网段的默认网卡", "adapter", current, { choices: [["", "系统自动路由"], ...choices] }) +
     '<div id="udpRoutes">' + routes.map(route => routeRow(route)).join("") + "</div>" +
     '<button type="button" class="button quiet" id="addUdpRoute">＋ 添加网段与网卡</button>' +
@@ -409,7 +410,7 @@ async function editUdpAdapter() {
       }));
       if (routes.some(route => !route.network || !route.interfaceId)) throw new Error("请为每条规则填写目标网段和发送网卡。");
       if (routes.length > 128) throw new Error("最多配置 128 条 UDP 网段规则。");
-      Object.assign(state.project, { udpInterfaceId: data.get("adapter") || null, udpRoutes: routes });
+      Object.assign(state.project, { udpInterfaceId: data.get("adapter") || null, udpRoutes: routes, adapterWaitSeconds: Number(data.get("adapterWaitSeconds")) });
     });
   $("addUdpRoute").addEventListener("click", () => {
     $("udpRoutes").insertAdjacentHTML("beforeend", routeRow());
@@ -623,6 +624,16 @@ function updateScheduleMode() {
   const indicator = $("scheduleMode");
   if (indicator)
     indicator.textContent = `今日定时 · ${scheduleModes[state.scheduleMode]}${state.timezone ? " · " + state.timezone : ""}`;
+  const recent = $("scheduleResults");
+  if (!recent) return;
+  const labels = { accepted: "已触发", skipped: "已跳过", missed: "已错过", pending: "结果待确认" };
+  const rows = (state.scheduleStatus?.attempts ?? []).map(item => `<tr><td>${esc(localTime(item.due))}</td><td>${esc(item.name)}</td><td>${esc(labels[item.result] ?? item.result)}</td><td>${esc(item.detail)}</td></tr>`).join("");
+  const content = (state.scheduleStatus?.error ? `<p class="badge warn">${esc(state.scheduleStatus.error)}</p>` : "") +
+    table(["原定时间", "任务", "触发结果", "详情"], rows, "暂无记录");
+  if (recent.dataset.rendered !== content) {
+    recent.innerHTML = content;
+    recent.dataset.rendered = content;
+  }
 }
 
 function renderResource() {
@@ -650,7 +661,8 @@ function renderResource() {
     content = '<p id="scheduleMode" class="schedule-mode" role="status"></p>' +
       table(["任务", "模式", "日期规则", "时间", "Cue 列表", "状态", "操作"], entries.map(item =>
         `<tr><td>${esc(item.name)}</td><td>${badge(scheduleModes[item.mode ?? "weekly"])}</td><td>${esc(scheduleDays(item))}</td>
-        <td class="mono">${esc(item.at)}</td><td>${esc(listLabel(item.listId))}</td><td>${badge(item.enabled ? "已启用" : "已停用", item.enabled ? "good" : "")}</td><td><div class="actions">${edit(item)}</div></td></tr>`).join(""));
+        <td class="mono">${esc(item.at)}</td><td>${esc(listLabel(item.listId))}</td><td>${badge(item.enabled ? "已启用" : "已停用", item.enabled ? "good" : "")}</td><td><div class="actions">${edit(item)}</div></td></tr>`).join("")) +
+      '<details class="schedule-history"><summary>最近定时记录</summary><div id="scheduleResults"></div></details>';
   }
   const fileActions = kind === "ips" ? button("导入 Excel / TXT", "import-ips", "", "quiet", state.importingIps) +
     button("导出 Excel", "export-ips", "xlsx", "quiet") + button("导出 TXT", "export-ips", "txt", "quiet") : "";
@@ -752,6 +764,49 @@ function downloadCsv(name, rows) {
     return '"' + (/^(?:[\t\r\n]|\s*[=+\-@])/.test(string) ? "'" : "") + string.replaceAll('"', '""') + '"';
   };
   downloadFile(name, new Blob(["\uFEFF", rows.map(row => row.map(cell).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" }));
+}
+
+async function showProjectFiles() {
+  const backups = await request("/project/history");
+  if (state.access.role !== "admin" || $("editor").open) return;
+  edit("工程文件", '<div class="actions">' + button("导出已保存工程", "project-export", "", "strong") +
+    button("导入配置", "project-import", "", "quiet") + '</div><p class="property-help">配置可带到另一台电脑。导入后请核对 UDP 网卡并保存。</p>' +
+    '<h3>历史版本</h3>' + table(["工程", "保存时间", "操作"], backups.map(item =>
+      `<tr><td>${esc(item.name)} · ${item.revision}</td><td>${esc(localTime(item.savedAt))}</td><td>${button("恢复", "project-restore", item.id, "quiet")}</td></tr>`).join(""), "暂无可恢复版本"), () => {}, null, false);
+  $("editor").querySelector('button[type="submit"]').textContent = "关闭";
+  $("cancelEdit").hidden = true;
+}
+
+async function exportProjectConfiguration() {
+  const response = await fetch("/api/project/configuration");
+  if (!response.ok) throw new Error("导出失败，请检查工程权限。");
+  downloadFile("ShowControl-project.json", await response.blob());
+}
+
+async function importProjectConfiguration(file) {
+  if (file.size > 8 * 1024 * 1024) throw new Error("工程配置文件最大为 8 MB。");
+  let configuration;
+  try { configuration = JSON.parse(await file.text()); }
+  catch { throw new Error("请选择有效的工程配置 JSON。"); }
+  const project = await request("/project/configuration", "POST", configuration);
+  if (state.access.role !== "admin") return;
+  if (state.dirty && !confirm("导入会替换当前未保存的草稿。继续吗？")) return;
+  state.project = project;
+  linkNodes();
+  state.health = [];
+  $("editor").close();
+  dirty();
+  render();
+  notice("配置已导入草稿。请核对 UDP 网卡，然后保存项目。");
+}
+
+async function restoreProject(id) {
+  if (!confirm("将所选历史版本恢复为已保存工程，并替换当前草稿。继续吗？")) return;
+  await request("/project/restore", "PUT", { id, revision: state.revision });
+  $("editor").close();
+  await load();
+  await poll();
+  notice("工程版本已恢复。");
 }
 
 function downloadFile(name, blob) {
@@ -871,6 +926,7 @@ function editResource(id) {
       fields += field("定时模式", "mode", mode, { choices: Object.entries(scheduleModes) }) +
         field("执行时间", "at", item?.at ?? "19:00", { type: "time", required: true }) +
         '<div id="scheduleFields" class="property-form wide">' + scheduleFields(mode, item) + "</div>" +
+        field("补播窗口 (分钟，0 为跳过)", "catchUpMinutes", item?.catchUpMinutes ?? 0, { type: "number", min: 0, max: 60, required: true }) +
         field("启用任务", "enabled", item?.enabled ?? false, { type: "checkbox" });
     }
   }
@@ -902,7 +958,7 @@ function editResource(id) {
         const endDate = mode === "holiday" ? data.get("endDate") : null;
         if (days && !days.length) throw new Error("请至少选择一个执行日。");
         if (mode === "holiday" && endDate < startDate) throw new Error("结束日期必须在起始日期当天或之后。");
-        Object.assign(next, { mode, days, startDate, endDate, at: data.get("at"), enabled: data.has("enabled") });
+        Object.assign(next, { mode, days, startDate, endDate, at: data.get("at"), enabled: data.has("enabled"), catchUpMinutes: Number(data.get("catchUpMinutes")) });
       }
     }
     if (item) Object.assign(item, next);
@@ -1220,7 +1276,10 @@ async function act(action, id, target) {
     const to = from + (action === "up" ? -1 : 1);
     [cues[from], cues[to]] = [cues[to], cues[from]];
     dirty();
-  } else if (action === "edit-resource") return editResource(id);
+  } else if (action === "project-export") return exportProjectConfiguration();
+  else if (action === "project-import") return $("projectImportFile").click();
+  else if (action === "project-restore") return restoreProject(id);
+  else if (action === "edit-resource") return editResource(id);
   else if (action === "delete-resource") return deleteResource(id);
   else if (action === "run" || action === "tree-play") return run("/run/" + id);
   else if (action === "stop-selected") {
@@ -1296,6 +1355,11 @@ async function poll() {
     if (version !== statusRequest) return;
     $("lockStatus").textContent = `引擎继续运行 · ${data.activeCount ?? 0} 个列表 · ${data.live ? "真实 UDP" : "模拟模式"}`;
   }
+  $("projectRecovery").hidden = !data.projectRecovery;
+  state.scheduleStatus = data.scheduleStatus;
+  const scheduleError = state.scheduleStatus?.error ?? "";
+  $("scheduleRecovery").hidden = !scheduleError;
+  if ($("scheduleRecovery").textContent !== scheduleError) $("scheduleRecovery").textContent = scheduleError;
   state.runs = data.runs ?? (data.active ? [data.active] : []);
   const countdowns = new Map();
   for (const run of state.runs) {
@@ -1318,7 +1382,7 @@ async function poll() {
   $("logs").innerHTML = data.events.map(event => `<tr><td class="mono">${esc(new Date(event.at).toLocaleTimeString("zh-CN", { hour12: false }))}</td>
     <td>${esc(sourceLabels[event.source] ?? event.source)}</td><td>${esc([event.list, event.cue].filter(Boolean).join(" / "))}</td>
     <td>${badge(eventLabels[event.status] ?? event.status, ["success", "ack", "completed"].includes(event.status) ? "good" :
-      ["failed", "stopped"].includes(event.status) ? "bad" : ["retry", "skipped", "priority", "adapterWait"].includes(event.status) ? "warn" : "")}</td><td>${esc(event.message)}</td></tr>`).join("") ||
+      ["failed", "stopped"].includes(event.status) ? "bad" : ["retry", "skipped", "priority", "adapterWait"].includes(event.status) ? "warn" : "")}</td><td class="log-detail">${esc(event.message)}</td></tr>`).join("") ||
     '<tr><td colspan="5">等待首条执行记录</td></tr>';
 }
 
@@ -1425,6 +1489,14 @@ $("treePager").addEventListener("click", event => {
 });
 $("closeEditor").addEventListener("click", () => $("editor").close());
 $("cancelEdit").addEventListener("click", () => $("editor").close());
+$("projectFiles").addEventListener("click", () => showProjectFiles().catch(error => notice(error.message, true)));
+$("projectImportFile").addEventListener("change", async event => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  try { await importProjectConfiguration(file); }
+  catch (error) { $("formError").textContent = error.message; }
+});
 $("editForm").addEventListener("submit", async event => {
   event.preventDefault();
   const submit = event.target.querySelector('[type="submit"]');

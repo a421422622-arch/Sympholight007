@@ -8,7 +8,7 @@ namespace ShowControl;
 
 internal sealed record Project(string Name, Show[] Shows, IpGroup[] IpGroups, CommandTemplate[] Templates,
     Schedule[] Schedules, PadButton[] Pads, string? UdpInterfaceId = null, UdpRoute[]? UdpRoutes = null,
-    int HealthPollSeconds = 0, Node[]? NodeLibrary = null)
+    int HealthPollSeconds = 0, Node[]? NodeLibrary = null, int AdapterWaitSeconds = 15)
 {
     [JsonIgnore]
     public IEnumerable<CueList> Lists => Shows.SelectMany(show => show.Groups).SelectMany(group => group.Lists);
@@ -48,9 +48,11 @@ internal sealed record HealthQuery(int Port, string Payload, string Reply, strin
 internal sealed record CommandTemplate(string Id, string Name, string Payload, string Encoding,
     ReplyPolicy? Response = null, int? Port = null);
 internal sealed record Schedule(string Id, string Name, string ListId, string At, bool Enabled,
-    string Mode = "weekly", DayOfWeek[]? Days = null, DateOnly? StartDate = null, DateOnly? EndDate = null);
+    string Mode = "weekly", DayOfWeek[]? Days = null, DateOnly? StartDate = null, DateOnly? EndDate = null,
+    int CatchUpMinutes = 0);
 internal sealed record PadButton(string Id, string Name, string ListId, string Action = "play");
 internal sealed record Snapshot(long Revision, Project Project);
+internal sealed record ProjectBackup(string Id, string Name, long Revision, DateTimeOffset SavedAt);
 
 internal static class ProjectRules
 {
@@ -69,6 +71,8 @@ internal static class ProjectRules
     {
         var ids = new HashSet<string>(StringComparer.Ordinal);
         Name(project.Name);
+        if (project.AdapterWaitSeconds is < 1 or > 300)
+            throw new ArgumentException("网卡等待上限须为 1–300 秒。");
         if (project.HealthPollSeconds != 0 && project.HealthPollSeconds is < 5 or > 3600)
             throw new ArgumentException("节点检测间隔须为 5–3600 秒，或设为 0 使用手动检测。");
         if (project.UdpInterfaceId is { } adapter)
@@ -207,6 +211,8 @@ internal static class ProjectRules
                 "holiday" => schedule.StartDate.HasValue && schedule.EndDate.HasValue && schedule.EndDate >= schedule.StartDate,
                 _ => false
             };
+            if (schedule.CatchUpMinutes is < 0 or > 60)
+                throw new ArgumentException($"任务「{schedule.Name}」的补播窗口须为 0–60 分钟。");
             if (!validCalendar)
                 throw new ArgumentException($"任务「{schedule.Name}」的星期、指定日期或节假日范围无效。");
         }
@@ -285,30 +291,40 @@ internal sealed class ProjectStore : IDisposable
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     private readonly object gate = new();
     private readonly string path;
+    private readonly string history;
     private readonly FileStream writerLock;
     private Snapshot snapshot;
+    private bool recovery;
+    public bool RequiresRecovery { get { lock (gate) return recovery; } }
 
     public ProjectStore(string directory)
     {
         Directory.CreateDirectory(directory);
         path = Path.Combine(directory, "project.json");
+        history = Path.Combine(directory, "project-history");
         writerLock = File.Open(Path.Combine(directory, "project.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        if (!File.Exists(path))
+        try
         {
-            snapshot = new(1, DispatchPlan.Normalize(Demo()));
-            Persist(snapshot);
-            return;
+            if (!File.Exists(path) && !Directory.Exists(history))
+            {
+                snapshot = new(1, DispatchPlan.Normalize(Demo()));
+                SaveFile(path, snapshot);
+                return;
+            }
+            var loaded = Read(path);
+            if (loaded.Project.NodeLibrary is null)
+            {
+                var backup = path + ".before-node-library.bak";
+                if (!File.Exists(backup)) File.Copy(path, backup);
+            }
+            snapshot = Normalize(loaded);
         }
-        snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllBytes(path), Json)
-            ?? throw new InvalidDataException("无法读取项目文件。");
-        ProjectRules.Check(snapshot.Project);
-        if (snapshot.Project.NodeLibrary is null)
+        catch (Exception error) when (InvalidSnapshot(error))
         {
-            var backup = path + ".before-node-library.bak";
-            if (!File.Exists(backup)) File.Copy(path, backup);
+            var candidate = BackupFiles().Select(file => TryRead(file.FullName)).FirstOrDefault(item => item is not null);
+            snapshot = candidate ?? new(1, new Project("待恢复工程", [], [], [], [], [], NodeLibrary: []));
+            recovery = true;
         }
-        snapshot = snapshot with { Project = DispatchPlan.Normalize(snapshot.Project) };
-        ProjectRules.Check(snapshot.Project);
     }
 
     public void Dispose() => writerLock.Dispose();
@@ -329,19 +345,97 @@ internal sealed class ProjectStore : IDisposable
         {
             if (edit.Revision != snapshot.Revision)
                 return null;
-            var next = new Snapshot(snapshot.Revision + 1, edit.Project);
-            Persist(next);
+            var next = new Snapshot(NextRevision(snapshot.Revision), edit.Project);
+            Commit(next);
             snapshot = next;
+            recovery = false;
             return next;
         }
     }
 
-    private void Persist(Snapshot next)
+    public ProjectBackup[] Backups()
+    {
+        lock (gate)
+            return BackupFiles().Select(file => (File: file, Snapshot: TryRead(file.FullName)))
+                .Where(item => item.Snapshot is not null).Select(item => new ProjectBackup(item.File.Name,
+                    item.Snapshot!.Project.Name, item.Snapshot.Revision, item.File.LastWriteTimeUtc)).ToArray();
+    }
+
+    public Snapshot? Restore(long revision, string id)
+    {
+        lock (gate)
+        {
+            if (revision != snapshot.Revision) return null;
+            var file = BackupFiles().FirstOrDefault(file => file.Name == id);
+            var selected = file is null ? null : TryRead(file.FullName);
+            if (selected is null) throw new ArgumentException("备份不存在或已损坏。");
+            var next = selected with { Revision = NextRevision(Math.Max(snapshot.Revision, selected.Revision)) };
+            Commit(next);
+            snapshot = next;
+            recovery = false;
+            return next;
+        }
+    }
+
+    private long NextRevision(long revision) => recovery
+        ? Math.Max(revision + 1, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) : revision + 1;
+
+    private void Commit(Snapshot next)
+    {
+        Directory.CreateDirectory(history);
+        if (!recovery)
+            SaveFile(Path.Combine(history, $"{DateTime.UtcNow:yyyyMMddHHmmssfffffff}-{Guid.NewGuid():N}.json"), snapshot);
+        else if (File.Exists(path))
+            File.Copy(path, Path.Combine(history, $"damaged-{Guid.NewGuid():N}.json"));
+        SaveFile(path, next);
+        try
+        {
+            foreach (var old in BackupFiles().Where(file => file.DirectoryName == history).Skip(10)) old.Delete();
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private IEnumerable<FileInfo> BackupFiles()
+    {
+        if (Directory.Exists(history))
+            foreach (var file in new DirectoryInfo(history).EnumerateFiles("*.json").Where(file => !file.Name.StartsWith("damaged-"))
+                .OrderByDescending(file => file.Name, StringComparer.Ordinal))
+                yield return file;
+        var migration = new FileInfo(path + ".before-node-library.bak");
+        if (migration.Exists) yield return migration;
+    }
+
+    private static Snapshot Read(string source) => JsonSerializer.Deserialize<Snapshot>(File.ReadAllBytes(source), Json)
+        ?? throw new InvalidDataException("无法读取项目文件。");
+
+    private static Snapshot Normalize(Snapshot loaded)
+    {
+        ProjectRules.Check(loaded.Project);
+        var project = DispatchPlan.Normalize(loaded.Project);
+        ProjectRules.Check(project);
+        return loaded with { Project = project };
+    }
+
+    private static Snapshot? TryRead(string source)
+    {
+        try { return Normalize(Read(source)); }
+        catch (Exception error) when (InvalidSnapshot(error)) { return null; }
+    }
+
+    private static bool InvalidSnapshot(Exception error) => error is IOException or UnauthorizedAccessException or JsonException or
+        ArgumentException or InvalidDataException or NullReferenceException or InvalidOperationException;
+
+    internal static void SaveFile<T>(string path, T value)
     {
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            File.WriteAllBytes(temp, JsonSerializer.SerializeToUtf8Bytes(next, Json));
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, value, Json);
+                stream.Flush(flushToDisk: true);
+            }
             File.Move(temp, path, overwrite: true);
         }
         finally

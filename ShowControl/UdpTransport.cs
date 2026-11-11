@@ -22,7 +22,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
     public UdpReceipt? Latest(string ip) { lock (gate) return latest.GetValueOrDefault(ip); }
 
     public async Task<bool> Exchange(IPAddress address, int port, byte[] bytes, string encoding, NodeCommunication? communication,
-        UdpNetwork.Binding? binding, ReplyPolicy response, UdpContext context, Action<string, string> step,
+        string? adapter, int adapterWaitSeconds, ReplyPolicy response, UdpContext context, Action<string, string> step,
         Func<CancellationToken, Task<bool>>? afterSend, CancellationToken token)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, closing.Token);
@@ -53,6 +53,25 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
                 step("deviceWait", $"等待迟到回执隔离窗口 {cooldown.TotalSeconds:0.###} 秒");
                 await Task.Delay(cooldown, token);
             }
+            UdpNetwork.Binding? binding = null;
+            if (adapter is not null)
+            {
+                binding = UdpNetwork.Resolve(adapter, address.AddressFamily);
+                if (binding is null && adapterWaitSeconds > 0)
+                {
+                    step("adapterWait", $"网卡暂不可用，最多等待 {adapterWaitSeconds} 秒。");
+                    using var adapterDeadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    adapterDeadline.CancelAfter(TimeSpan.FromSeconds(adapterWaitSeconds));
+                    try { binding = await UdpNetwork.Wait(adapter, address.AddressFamily, null, adapterDeadline.Token); }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        step("failed", "网卡恢复等待超时。");
+                        return false;
+                    }
+                    step("adapterReady", "网卡已恢复，继续发送。");
+                }
+                if (binding is null) return false;
+            }
             var local = UdpNetwork.LocalAddressFor(address, port, binding);
             if (address.IsIPv6LinkLocal && binding is { Index: > 0 }) address = new IPAddress(address.GetAddressBytes(), binding.Index);
             sender = Acquire(local, communication?.SenderPort ?? 0, binding);
@@ -66,7 +85,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
             token.ThrowIfCancellationRequested();
             sent = true;
             await sender.Client.SendAsync(bytes, new IPEndPoint(address, port), token);
-            step("send", $"本机 {sender.Local} → {address}:{port} · 接收 {receiver.Local} · {(encoding == "hex" ? "HEX" : $"String ({encoding})")} {Display(bytes, encoding)} · HEX {Convert.ToHexString(bytes)}" +
+            step("send", $"本机 {sender.Local} → {address}:{port} · 接收 {receiver.Local} · {DispatchPlan.DescribePayload(bytes, encoding)}" +
                 (response.Mode == "none" ? " · 不等待回执" : ""));
             using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
             if (pending is not null) wait.CancelAfter(response.TimeoutMs);

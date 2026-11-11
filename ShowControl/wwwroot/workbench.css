@@ -188,6 +188,9 @@ dialog footer { justify-content: end; gap: 7px; border-bottom: 0; border-top: 1p
 #editor pre { margin: 3px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 #overrideFields { display: grid; gap: 10px; }
 .node-library-head { margin-top: 22px; display: flex; align-items: center; justify-content: space-between; }
+.schedule-history { margin-top: 16px; }
+.schedule-history summary { cursor: pointer; margin-bottom: 8px; }
+.log-detail { white-space: pre-wrap; overflow-wrap: anywhere; }
 .receipt-cell { min-width: 200px; max-width: 360px; white-space: normal; overflow-wrap: anywhere; }
 .receipt-cell code { white-space: pre-wrap; }
 #nodeBatchPreview .table-box { max-height: 180px; overflow: auto; }

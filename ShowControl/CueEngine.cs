@@ -197,73 +197,54 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
             ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response, item.Encoding))
             .GroupBy(item => (item.Address, item.Port)).ToArray();
         var router = options.Live ? new UdpNetwork.Router(project) : null;
-        var waves = dispatch.GroupBy(endpoint =>
-            (Adapter: router?.Select(endpoint.Key.Address), Family: endpoint.Key.Address.AddressFamily));
-        await Task.WhenAll(waves.Select(async wave =>
+        await Parallel.ForEachAsync(dispatch, new ParallelOptions
         {
-            var adapter = wave.Key.Adapter;
-            var family = wave.Key.Family;
-            var initialBinding = adapter is null ? null : await WaitForAdapter(family, adapter, token);
-            await Parallel.ForEachAsync(wave, new ParallelOptions
+            MaxDegreeOfParallelism = 512,
+            CancellationToken = token
+        }, async (endpoint, ct) =>
+        {
+            var adapter = router?.Select(endpoint.Key.Address);
+            foreach (var item in endpoint)
             {
-                MaxDegreeOfParallelism = 512,
-                CancellationToken = token
-            }, async (endpoint, ct) =>
-            {
-                var firstSend = true;
-                foreach (var item in endpoint)
+                var confirmed = false;
+                for (var attempt = 1; attempt <= attempts && !confirmed; attempt++)
                 {
-                    var confirmed = false;
-                    for (var attempt = 1; attempt <= attempts && !confirmed; attempt++)
+                    ct.ThrowIfCancellationRequested();
+                    void Step(string status, string message) =>
+                        Log(source, list.Name, cue.Name, status, $"{item.Group} · {item.Node.Ip}:{item.Port} · {message}");
+                    if (attempt > 1)
                     {
-                        ct.ThrowIfCancellationRequested();
-                        void Step(string status, string message) =>
-                            Log(source, list.Name, cue.Name, status, $"{item.Group} · {item.Node.Ip}:{item.Port} · {message}");
-                        if (attempt > 1)
-                        {
-                            Step("retry", $"第 {attempt}/{attempts} 次发送");
-                            await Task.Delay(200, ct);
-                        }
-                        var binding = adapter is null || firstSend ? initialBinding : await UdpNetwork.Wait(adapter, family, null, ct);
-                        firstSend = false;
-                        await udpSlots.WaitAsync(ct);
-                        try { confirmed = await Send(cue, item, binding, new(source, list.Name, cue.Name, item.Group), Step, ct); }
-                        finally { udpSlots.Release(); }
+                        Step("retry", $"第 {attempt}/{attempts} 次发送");
+                        await Task.Delay(200, ct);
                     }
-                    if (!confirmed)
-                        Interlocked.Exchange(ref failed, 1);
+                    await udpSlots.WaitAsync(ct);
+                    try
+                    {
+                        confirmed = await Send(cue, item, adapter, project.AdapterWaitSeconds,
+                            new(source, list.Name, cue.Name, item.Group), Step, ct);
+                    }
+                    finally { udpSlots.Release(); }
                 }
-            });
-        }));
+                if (!confirmed)
+                    Interlocked.Exchange(ref failed, 1);
+            }
+        });
         return failed == 0;
-
-        async Task<UdpNetwork.Binding> WaitForAdapter(AddressFamily family, string id, CancellationToken ct)
-        {
-            var waited = false;
-            var binding = await UdpNetwork.Wait(id, family, () =>
-            {
-                waited = true;
-                Log(source, list.Name, cue.Name, "adapterWait", $"UDP 网卡 {id} 暂不可用，正在等待恢复。");
-            }, ct);
-            if (waited)
-                Log(source, list.Name, cue.Name, "adapterReady", $"UDP 网卡 {id} 已恢复，继续发送。");
-            return binding;
-        }
     }
 
     private sealed record Dispatch(string Group, Node Node, System.Net.IPAddress Address, int Port, byte[] Bytes, ReplyPolicy Response, string Encoding);
 
-    private async Task<bool> Send(Cue cue, Dispatch item, UdpNetwork.Binding? binding, UdpContext context,
+    private async Task<bool> Send(Cue cue, Dispatch item, string? adapter, int adapterWaitSeconds, UdpContext context,
         Action<string, string> step, CancellationToken token)
     {
         try
         {
             if (options.Live)
                 return await transport.Exchange(item.Address, item.Port, item.Bytes, item.Encoding,
-                    item.Node.Communication, binding, item.Response, context, step, cue.Ping ? CheckPing : null, token);
+                    item.Node.Communication, adapter, adapterWaitSeconds, item.Response, context, step, cue.Ping ? CheckPing : null, token);
             token.ThrowIfCancellationRequested();
             var response = item.Response;
-            step("send", $"模拟发送 {item.Bytes.Length} 字节 UDP" +
+            step("send", $"模拟发送 {item.Bytes.Length} 字节 UDP · {DispatchPlan.DescribePayload(item.Bytes, item.Encoding)}" +
                 (response.Mode == "none" ? " · 不等待回执" : ""));
             if (cue.Ping && !await CheckPing(token)) return false;
             if (response.Mode == "none") return true;
@@ -379,10 +360,8 @@ internal sealed class NodeHealth(RuntimeOptions options, UdpTransport transport,
         try
         {
             var address = ProjectRules.ParseIp(node.Ip);
-            var binding = adapter is null ? null : UdpNetwork.Resolve(adapter, address.AddressFamily);
-            if (adapter is not null && binding is null) return false;
             return await transport.Exchange(address, query.Port, ProjectRules.Packet(query.Payload, query.Encoding),
-                query.Encoding, node.Communication, binding, new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding),
+                query.Encoding, node.Communication, adapter, 0, new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding),
                 new("health", "", "软件健康查询", node.Label),
                 (status, message) => logStore.Append(new(DateTimeOffset.Now, "health", "", "软件健康查询", status,
                     $"{node.Label} · {node.Ip}:{query.Port} · {message}")), null, token);
@@ -471,43 +450,80 @@ internal static class ScheduleCalendar
     };
 }
 
-internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine) : BackgroundService
+internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine, ScheduleJournal journal,
+    ILogger<ScheduleWorker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var lastMinute = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
-        var attempted = new Dictionary<string, DateOnly>();
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        do
         {
-            var now = DateTime.Now;
-            var minute = now.ToString("yyyy-MM-dd HH:mm");
-            if (minute == lastMinute)
-                continue;
-            lastMinute = minute;
-            var date = DateOnly.FromDateTime(now);
-            var project = store.Get().Project;
-            var priority = ScheduleCalendar.ActivePriority(project, date);
-            var startedGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var schedule in project.Schedules.Where(item => item.Enabled && item.At == now.ToString("HH:mm")))
+            if (store.RequiresRecovery || !journal.CanRun) continue;
+            try { Scan(); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
-                var taskPriority = ScheduleCalendar.Priority(schedule, date);
-                if (taskPriority == 0)
-                    continue;
-                if (attempted.TryGetValue(schedule.Id, out var previous) && previous == date)
-                    continue;
-                attempted[schedule.Id] = date;
-                if (taskPriority < priority)
-                    engine.SkipSchedule(schedule, priority == 3 ? "节目模式：指定日任务优先。" : "节目模式：节假日任务优先。");
-                else if (project.Lists.FirstOrDefault(list => list.Id == schedule.ListId && list.Cues.Length > 0) is not CueList list)
-                    engine.SkipSchedule(schedule, "目标 Cue 列表为空。");
-                else if (startedGroups.Contains(list.PlaybackGroup))
-                    engine.SkipSchedule(schedule, $"播放组「{list.PlaybackGroup}」同一时刻已有定时任务。");
-                else if (engine.Trigger(project, schedule.ListId, "schedule").Accepted)
-                    startedGroups.Add(list.PlaybackGroup);
+                logger.LogWarning(error, "Cannot persist schedule progress.");
             }
-            foreach (var id in attempted.Where(item => item.Value < date.AddDays(-1)).Select(item => item.Key).ToArray())
-                attempted.Remove(id);
+        } while (await timer.WaitForNextTickAsync(stoppingToken));
+    }
+
+    private void Scan()
+    {
+        var now = DateTimeOffset.Now;
+        var minute = now.ToUnixTimeSeconds() / 60;
+        var previous = journal.Minute;
+        var snapshot = store.Get();
+        if (previous == minute && journal.Revision == snapshot.Revision) return;
+        var project = snapshot.Project;
+        if (!project.Schedules.Any(schedule => schedule.Enabled)) return;
+        var first = journal.Revision == snapshot.Revision && previous.HasValue && previous < minute
+            ? Math.Max(previous.Value + 1, minute - 1440) : minute;
+        var startedGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var cursor = minute; cursor >= first; cursor--)
+        {
+            var due = DateTimeOffset.FromUnixTimeSeconds(cursor * 60).ToLocalTime();
+            var day = DateOnly.FromDateTime(due.DateTime);
+            var time = due.ToString("HH:mm");
+            var priority = ScheduleCalendar.ActivePriority(project, day);
+            foreach (var schedule in project.Schedules.Where(schedule => schedule.Enabled && schedule.At == time))
+            {
+                var taskPriority = ScheduleCalendar.Priority(schedule, day);
+                if (taskPriority == 0) continue;
+                var list = project.Lists.FirstOrDefault(list => list.Id == schedule.ListId && list.Cues.Length > 0);
+                if (journal.Find(schedule.Id, day) is { } recorded)
+                {
+                    if (list is not null && recorded.Result is "accepted" or "pending") startedGroups.Add(list.PlaybackGroup);
+                    continue;
+                }
+                var attempt = new ScheduleAttempt(schedule.Id, day, schedule.Name, due, "skipped", "");
+                var elapsedMinutes = minute - cursor;
+                if (elapsedMinutes > schedule.CatchUpMinutes)
+                    Skip(attempt with { Result = "missed" }, schedule, "已超过补播窗口。");
+                else if (taskPriority < priority)
+                    Skip(attempt, schedule, priority == 3 ? "节目模式：指定日任务优先。" : "节目模式：节假日任务优先。");
+                else if (list is null)
+                    Skip(attempt, schedule, "目标 Cue 列表为空。");
+                else if (startedGroups.Contains(list.PlaybackGroup))
+                    Skip(attempt, schedule, $"播放组「{list.PlaybackGroup}」本轮已有较新或同一时刻的任务。");
+                else
+                {
+                    journal.Record(attempt with { Result = "pending", Detail = "已记录触发，结果待确认。" });
+                    var result = engine.Trigger(project, schedule.ListId, "schedule");
+                    if (result.Accepted) startedGroups.Add(list.PlaybackGroup);
+                    journal.Record(attempt with
+                    {
+                        Result = result.Accepted ? "accepted" : "skipped",
+                        Detail = (elapsedMinutes > 0 ? "补播 · " : "") + result.Message
+                    });
+                }
+            }
         }
+        journal.Checkpoint(minute, DateOnly.FromDateTime(now.DateTime), snapshot.Revision);
+    }
+
+    private void Skip(ScheduleAttempt attempt, Schedule schedule, string detail)
+    {
+        journal.Record(attempt with { Detail = detail });
+        engine.SkipSchedule(schedule, detail);
     }
 }

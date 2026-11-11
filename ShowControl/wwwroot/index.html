@@ -17,11 +17,15 @@
       <button id="resetLayout" class="button quiet admin-only" type="button">恢复默认布局</button>
       <button id="permissions" class="button quiet admin-only" type="button">权限</button>
       <button id="udpAdapter" class="button quiet admin-only" type="button">UDP 网卡</button>
+      <button id="projectFiles" class="button quiet admin-only" type="button">工程文件</button>
       <button id="lock" class="button quiet" type="button">锁屏</button>
       <button id="stop" type="button" class="button danger" disabled>■ 全部停止</button>
       <button id="reload" class="button quiet" type="button">重新载入</button><button id="save" class="button strong admin-only" type="button" disabled>保存项目</button></div>
   </header>
   <div id="notice" class="notice" role="status" hidden></div>
+  <div id="projectRecovery" class="notice error" role="alert" hidden>工程文件需要恢复。请管理员在「工程文件」中恢复历史版本，或导入配置后保存。</div>
+  <div id="scheduleRecovery" class="notice error" role="alert" hidden></div>
+  <input id="projectImportFile" type="file" accept=".json,application/json" hidden>
   <main class="workbench" id="panelGrid">
     <aside class="sidebar" data-panel="project" aria-label="项目导航"><div class="panel-body">
       <div class="side-head"><div><span class="eyebrow">01 / 导航</span><h2>项目结构</h2></div>

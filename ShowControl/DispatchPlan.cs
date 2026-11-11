@@ -72,4 +72,11 @@ internal static class DispatchPlan
         }
         catch (DecoderFallbackException) { return false; }
     }
+
+    public static string DescribePayload(byte[] bytes, string encoding)
+    {
+        var hex = "HEX " + Convert.ToHexString(bytes);
+        if (encoding == "hex") return hex;
+        return $"String ({encoding}) {ProjectRules.TextEncoding(encoding).GetString(bytes)} · {hex}";
+    }
 }

@@ -12,16 +12,19 @@ var port = int.TryParse(builder.Configuration["SHOWCONTROL_PORT"], out var value
     ? value : 8240;
 var options = new RuntimeOptions(builder.Configuration["SHOWCONTROL_LIVE"] == "1");
 var desktop = builder.Configuration["SHOWCONTROL_DESKTOP"] == "1";
+var desktopPort = int.TryParse(builder.Configuration["SHOWCONTROL_DESKTOP_PORT"], out var requestedPort) &&
+    requestedPort is >= 1024 and <= 65535 ? requestedPort : 0;
 var directory = builder.Configuration["SHOWCONTROL_DATA_DIR"] ?? Path.Combine(AppContext.BaseDirectory, "data");
 builder.WebHost.ConfigureKestrel(server =>
 {
     if (desktop)
-        server.Listen(IPAddress.Loopback, 0);
+        server.Listen(IPAddress.Loopback, desktopPort);
     else
         server.ListenLocalhost(port);
     server.Limits.MaxRequestBodySize = 2 * 1024 * 1024;
 });
 builder.Services.AddSingleton(_ => new ProjectStore(directory));
+builder.Services.AddSingleton(_ => new ScheduleJournal(directory, options.Live));
 builder.Services.AddSingleton(_ => new AccessControl(directory));
 builder.Services.AddSingleton(_ => new WorkspaceLayout(directory));
 builder.Services.AddSingleton(options);
@@ -62,11 +65,16 @@ app.Use(async (context, next) =>
     context.Response.Headers["Content-Security-Policy"] =
         "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
     context.Response.Headers.CacheControl = "no-store";
+    if (context.Request.Path.StartsWithSegments("/api/project") && (HttpMethods.IsPut(context.Request.Method) ||
+        HttpMethods.IsPost(context.Request.Method)) && context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } bodyLimit)
+        bodyLimit.MaxRequestBodySize = 8L * 1024 * 1024;
     if (context.Request.Path.StartsWithSegments("/api") &&
         !context.Request.Path.StartsWithSegments("/api/access") && context.Request.Path != "/api/status")
     {
         var role = context.RequestServices.GetRequiredService<AccessControl>().View(SessionToken(context)).Role;
         var adminOnly = context.Request.Path.StartsWithSegments("/api/ip-library") ||
+            context.Request.Path.StartsWithSegments("/api/project/configuration") ||
+            context.Request.Path.StartsWithSegments("/api/project/history") ||
             (HttpMethods.IsPut(context.Request.Method) && (context.Request.Path.StartsWithSegments("/api/project") ||
                 context.Request.Path.StartsWithSegments("/api/layout")));
         if (role is null || (adminOnly && role != "admin"))
@@ -121,6 +129,35 @@ api.MapPut("/layout", (WorkspaceLayout layout, JsonElement data) =>
     catch (JsonException) { return Results.BadRequest(new { message = "面板布局格式无效。" }); }
 });
 api.MapGet("/project", (ProjectStore store) => store.Get());
+api.MapGet("/project/history", (ProjectStore store) => store.Backups());
+api.MapPut("/project/restore", (RestoreProject request, ProjectStore store) =>
+{
+    try
+    {
+        var restored = store.Restore(request.Revision, request.Id);
+        return restored is null ? Results.Conflict(new { message = "工程已更新，请重新载入。" }) : Results.Ok(restored);
+    }
+    catch (ArgumentException error) { return Results.BadRequest(new { message = error.Message }); }
+});
+api.MapGet("/project/configuration", (ProjectStore store) => Results.File(
+    JsonSerializer.SerializeToUtf8Bytes(new PortableProject("showcontrol-project", 1, store.Get().Project),
+        new JsonSerializerOptions(JsonSerializerDefaults.Web) { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }),
+    "application/json", "ShowControl-project.json"));
+api.MapPost("/project/configuration", (PortableProject request) =>
+{
+    if (request.Format != "showcontrol-project" || request.Version != 1 || request.Project is null)
+        return Results.BadRequest(new { message = "请选择此程序导出的工程配置 JSON。" });
+    try
+    {
+        var project = DispatchPlan.Normalize(request.Project);
+        ProjectRules.Check(project);
+        return Results.Ok(project);
+    }
+    catch (Exception error) when (error is ArgumentException or NullReferenceException or InvalidOperationException)
+    {
+        return Results.BadRequest(new { message = "配置无效。" + (error is ArgumentException ? error.Message : "请重新导出完整工程。") });
+    }
+});
 api.MapPost("/dispatch-preview", (PreviewRequest request) =>
 {
     try
@@ -147,7 +184,7 @@ api.MapPut("/project", (Snapshot edit, ProjectStore store) =>
     }
 });
 api.MapGet("/status", (HttpContext context, CueEngine engine, RuntimeOptions settings, ProjectStore store, AccessControl access,
-    NodeHealth health, ExecutionLogStore logs, UdpTransport transport) =>
+    NodeHealth health, ExecutionLogStore logs, UdpTransport transport, ScheduleJournal schedule) =>
 {
     var state = engine.Status();
     var priority = ScheduleCalendar.ActivePriority(store.Get().Project, DateOnly.FromDateTime(DateTime.Now));
@@ -157,18 +194,21 @@ api.MapGet("/status", (HttpContext context, CueEngine engine, RuntimeOptions set
     return new { settings.Live, Active = runs.FirstOrDefault(), Runs = runs,
         Events = view.Role is null ? [] : state.Events, ActiveCount = state.Runs.Length,
         ReceiptVersion = view.Role is null ? 0 : transport.Version,
+        ProjectRecovery = view.Role is not null && store.RequiresRecovery,
+        ScheduleStatus = view.Role is null ? null : schedule.Status,
         Access = view, HealthScan = view.Role is null ? null : health.Progress,
         LogStorageWarning = view.Role is not null && (logStatus.Error is not null || logStatus.LostEntries > 0),
         TimeZone = TimeZoneInfo.Local.Id,
         ScheduleMode = ScheduleCalendar.Mode(priority) };
 });
 api.MapPost("/run/{id}", (string id, ProjectStore store, CueEngine engine) =>
-    Result(engine.Trigger(store.Get().Project, id, "manual")));
+    store.RequiresRecovery ? RecoveryRequired() : Result(engine.Trigger(store.Get().Project, id, "manual")));
 api.MapPost("/pad/{id}", (string id, ProjectStore store, CueEngine engine) =>
 {
     var project = store.Get().Project;
     var pad = project.Pads.FirstOrDefault(item => item.Id == id);
     if (pad is null) return Results.NotFound(new { message = "Action Pad 按钮不存在。" });
+    if (pad.Action != "stopAll" && store.RequiresRecovery) return RecoveryRequired();
     if (pad.Action != "stopAll") return Result(engine.Trigger(project, pad.ListId, "pad"));
     var count = engine.StopAll();
     return Results.Ok(new { accepted = true, message = $"已请求停止 {count} 个播放列表。" });
@@ -181,7 +221,7 @@ api.MapPost("/stop", (CueEngine engine) =>
 api.MapPost("/stop/{id:guid}", (Guid id, CueEngine engine) => Results.Ok(new { stopped = engine.Stop(id) }));
 api.MapGet("/health", (ProjectStore store, NodeHealth health) => health.Get(store.Get().Project));
 api.MapPost("/health/refresh", async (ProjectStore store, NodeHealth health, CancellationToken token) =>
-    await health.Refresh(store.Get().Project, token));
+    store.RequiresRecovery ? RecoveryRequired() : Results.Ok(await health.Refresh(store.Get().Project, token)));
 api.MapPost("/ip-library/import", async (HttpRequest request, CancellationToken token) =>
 {
     try
@@ -234,6 +274,7 @@ if (desktop)
 app.Run();
 
 static IResult Result(TriggerResult result) => result.Accepted ? Results.Accepted(value: result) : Results.Conflict(result);
+static IResult RecoveryRequired() => Results.Conflict(new { message = "请先恢复工程，或导入配置并保存，再执行控制。" });
 static string CookieName(HttpContext context) => $"showcontrol-{context.Connection.LocalPort}";
 static string? SessionToken(HttpContext context) => context.Request.Cookies[CookieName(context)];
 static void SetSession(HttpContext context, string token) => context.Response.Cookies.Append(CookieName(context), token,
@@ -242,3 +283,5 @@ static IResult Denied(bool locked) => Results.Json(new { message = locked ? "请
     statusCode: locked ? 423 : 403);
 
 internal sealed record PreviewRequest(Project Project, string CueId);
+internal sealed record RestoreProject(long Revision, string Id);
+internal sealed record PortableProject(string Format, int Version, Project Project);
