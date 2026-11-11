@@ -119,6 +119,17 @@ api.MapPut("/layout", (WorkspaceLayout layout, JsonElement data) =>
     catch (JsonException) { return Results.BadRequest(new { message = "面板布局格式无效。" }); }
 });
 api.MapGet("/project", (ProjectStore store) => store.Get());
+api.MapPost("/dispatch-preview", (PreviewRequest request) =>
+{
+    try
+    {
+        var project = DispatchPlan.Normalize(request.Project);
+        ProjectRules.Check(project);
+        var cue = project.Lists.SelectMany(list => list.Cues).SingleOrDefault(cue => cue.Id == request.CueId);
+        return cue is null ? Results.NotFound(new { message = "Cue 不存在。" }) : Results.Ok(DispatchPlan.Build(project, cue));
+    }
+    catch (ArgumentException error) { return Results.BadRequest(new { message = error.Message }); }
+});
 api.MapPut("/project", (Snapshot edit, ProjectStore store) =>
 {
     try
@@ -226,3 +237,5 @@ static void SetSession(HttpContext context, string token) => context.Response.Co
     new CookieOptions { Path = "/api", HttpOnly = true, SameSite = SameSiteMode.Strict });
 static IResult Denied(bool locked) => Results.Json(new { message = locked ? "请先解锁。" : "此操作需要管理员权限。" },
     statusCode: locked ? 423 : 403);
+
+internal sealed record PreviewRequest(Project Project, string CueId);

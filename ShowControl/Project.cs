@@ -8,7 +8,7 @@ namespace ShowControl;
 
 internal sealed record Project(string Name, Show[] Shows, IpGroup[] IpGroups, CommandTemplate[] Templates,
     Schedule[] Schedules, PadButton[] Pads, string? UdpInterfaceId = null, UdpRoute[]? UdpRoutes = null,
-    int HealthPollSeconds = 0)
+    int HealthPollSeconds = 0, Node[]? NodeLibrary = null)
 {
     [JsonIgnore]
     public IEnumerable<CueList> Lists => Shows.SelectMany(show => show.Groups).SelectMany(group => group.Lists);
@@ -22,24 +22,29 @@ internal sealed record CueList(string Id, string Name, Cue[] Cues,
     public int DelayAfter(Cue cue) => cue.DelayAfterMs ?? IntervalMs;
 }
 internal sealed record Cue(string Id, string Name, string IpGroupId, string? TemplateId, string Payload,
-    string Encoding, int Port, bool Ping, string Reply, int TimeoutMs, string OnFail, int Retries,
-    CueTarget[]? AdditionalTargets = null, int? DelayAfterMs = null, ReplyPolicy? Response = null)
+    string Encoding, int? Port, bool Ping, string Reply, int TimeoutMs, string OnFail, int Retries,
+    CueTarget[]? AdditionalTargets = null, int? DelayAfterMs = null, ReplyPolicy? Response = null,
+    NodeCommandOverride[]? NodeOverrides = null)
 {
     public IEnumerable<CueTarget> DispatchTargets()
     {
         var legacy = new ReplyPolicy("exact", Reply, TimeoutMs);
-        yield return new(IpGroupId, TemplateId, Payload, Encoding, Port, Response ?? legacy);
+        yield return new(IpGroupId, TemplateId, Payload, Encoding, Port, Response ?? legacy, NodeOverrides);
         foreach (var target in AdditionalTargets ?? [])
             yield return target with { Response = target.Response ?? legacy };
     }
 }
-internal sealed record CueTarget(string IpGroupId, string? TemplateId, string Payload, string Encoding, int Port,
-    ReplyPolicy? Response = null);
+internal sealed record CueTarget(string IpGroupId, string? TemplateId, string Payload, string Encoding, int? Port,
+    ReplyPolicy? Response = null, NodeCommandOverride[]? NodeOverrides = null);
+internal sealed record NodeCommandOverride(string Ip, string? TemplateId = null, int? Port = null, ReplyPolicy? Response = null);
 internal sealed record ReplyPolicy(string Mode, string? Text = null, int TimeoutMs = 1800);
 internal sealed record IpGroup(string Id, string Name, Node[] Nodes);
-internal sealed record Node(string Ip, string Label, string Simulation, HealthQuery? HealthQuery = null);
-internal sealed record HealthQuery(int Port, string Payload, string Reply);
-internal sealed record CommandTemplate(string Id, string Name, string Payload, string Encoding);
+internal sealed record Node(string Ip, string Label, string Simulation, HealthQuery? HealthQuery = null,
+    NodeCommunication? Communication = null, bool PingEnabled = true, bool Customized = false);
+internal sealed record NodeCommunication(int? TargetPort = null, int SenderPort = 0, int? ReceiverPort = null);
+internal sealed record HealthQuery(int Port, string Payload, string Reply, string Match = "exact", int TimeoutMs = 800);
+internal sealed record CommandTemplate(string Id, string Name, string Payload, string Encoding,
+    ReplyPolicy? Response = null, int? Port = null);
 internal sealed record Schedule(string Id, string Name, string ListId, string At, bool Enabled,
     string Mode = "weekly", DayOfWeek[]? Days = null, DateOnly? StartDate = null, DateOnly? EndDate = null);
 internal sealed record PadButton(string Id, string Name, string ListId, string Action = "play");
@@ -71,6 +76,11 @@ internal static class ProjectRules
         Limit(project.Templates, 100);
         Limit(project.Schedules, 100);
         Limit(project.Pads, 100);
+        Limit(project.NodeLibrary ?? [], 512);
+        var libraryIps = new HashSet<IPAddress>();
+        foreach (var node in project.NodeLibrary ?? [])
+            if (!libraryIps.Add(ParseIp(node.Ip)))
+                throw new ArgumentException("统一节点库包含重复 IP 地址。");
         var queries = new Dictionary<IPAddress, HealthQuery>();
         foreach (var group in project.IpGroups)
         {
@@ -83,11 +93,17 @@ internal static class ProjectRules
                 if (node.Label is null || node.Label.Length > 80 || !seen.Add(address) ||
                     node.Simulation is not ("ok" or "pingFail" or "timeout"))
                     throw new ArgumentException($"IP 分组「{group.Name}」包含重复节点或无效配置。");
+                if (node.Communication is { } communication &&
+                    (communication.TargetPort is < 1 or > 65535 || communication.SenderPort is < 0 or > 65535 ||
+                        communication.ReceiverPort is < 1 or > 65535))
+                    throw new ArgumentException($"节点「{node.Ip}」的通信端口无效。");
                 if (node.HealthQuery is { } query)
                 {
                     if (query.Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(query.Reply) || query.Reply.Length > 120)
                         throw new ArgumentException($"节点「{node.Ip}」的健康查询端口或回执无效。");
                     _ = Packet(query.Payload, "utf8");
+                    DispatchPlan.CheckResponse(new(query.Match, query.Reply, query.TimeoutMs));
+                    if (query.Match == "none") throw new ArgumentException("软件健康查询需要匹配回执。");
                     if (queries.TryGetValue(address, out var previous) && previous != query)
                         throw new ArgumentException($"节点「{node.Ip}」在多个分组中的健康查询设置不一致。");
                     queries[address] = query;
@@ -100,6 +116,8 @@ internal static class ProjectRules
         {
             Identity(template.Id, template.Name);
             _ = Packet(template.Payload, template.Encoding);
+            if (template.Port is < 1 or > 65535) throw new ArgumentException("模板端口须为 1–65535 或留空。");
+            if (template.Response is { } response) DispatchPlan.CheckResponse(response);
         }
         foreach (var show in project.Shows)
         {
@@ -134,12 +152,25 @@ internal static class ProjectRules
                             if (target.Port is < 1 or > 65535)
                                 throw new ArgumentException($"Cue「{cue.Name}」的目标组「{ipGroup.Name}」UDP 端口无效。");
                             var response = target.Response!;
-                            if (response.Mode is not ("none" or "exact") || (response.Mode == "exact" &&
-                                (response.TimeoutMs is < 100 or > 30000 ||
-                                    string.IsNullOrWhiteSpace(response.Text) || response.Text.Length > 120)))
-                                throw new ArgumentException($"Cue「{cue.Name}」的目标组「{ipGroup.Name}」回执设置无效。");
+                            DispatchPlan.CheckResponse(response, allowInherit: true);
+                            Limit(target.NodeOverrides ?? [], 128);
+                            var overrides = new HashSet<IPAddress>();
+                            foreach (var custom in target.NodeOverrides ?? [])
+                            {
+                                var ip = ParseIp(custom.Ip);
+                                if (!overrides.Add(ip) || !ipGroup.Nodes.Any(node => ParseIp(node.Ip).Equals(ip)) ||
+                                    custom.Port is < 1 or > 65535 || (custom.TemplateId is not null &&
+                                        !project.Templates.Any(template => template.Id == custom.TemplateId)))
+                                    throw new ArgumentException($"Cue「{cue.Name}」的节点例外无效，请检查地址、端口和模板。");
+                                if (custom.Response is { } policy) DispatchPlan.CheckResponse(policy);
+                            }
                             if (target.TemplateId is null)
                                 _ = Packet(target.Payload, target.Encoding);
+                        }
+                        foreach (var item in DispatchPlan.Build(project, cue))
+                        {
+                            _ = Packet(item.Payload, item.Encoding);
+                            DispatchPlan.CheckResponse(item.Response);
                         }
                         if (cue.OnFail is not ("retry" or "skip" or "stop") || cue.Retries is < 0 or > 5)
                             throw new ArgumentException($"Cue「{cue.Name}」的失败策略无效。");
@@ -249,12 +280,19 @@ internal sealed class ProjectStore : IDisposable
         writerLock = File.Open(Path.Combine(directory, "project.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         if (!File.Exists(path))
         {
-            snapshot = new(1, Demo());
+            snapshot = new(1, DispatchPlan.Normalize(Demo()));
             Persist(snapshot);
             return;
         }
         snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllBytes(path), Json)
             ?? throw new InvalidDataException("无法读取项目文件。");
+        ProjectRules.Check(snapshot.Project);
+        if (snapshot.Project.NodeLibrary is null)
+        {
+            var backup = path + ".before-node-library.bak";
+            if (!File.Exists(backup)) File.Copy(path, backup);
+        }
+        snapshot = snapshot with { Project = DispatchPlan.Normalize(snapshot.Project) };
         ProjectRules.Check(snapshot.Project);
     }
 
@@ -270,6 +308,7 @@ internal sealed class ProjectStore : IDisposable
     {
         if (edit.Project is null)
             throw new ArgumentException("缺少项目数据。");
+        edit = edit with { Project = DispatchPlan.Normalize(edit.Project) };
         ProjectRules.Check(edit.Project);
         lock (gate)
         {

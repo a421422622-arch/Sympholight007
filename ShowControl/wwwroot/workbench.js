@@ -7,12 +7,12 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({
 const ids = () => crypto.randomUUID();
 const policies = { retry: "重试", skip: "跳过", stop: "停止列表" };
 const healthLabels = { online: "在线", offline: "离线", unknown: "待检测" };
-const softwareLabels = { online: "在线", unconfirmed: "未确认", unknown: "待检测", notConfigured: "未配置" };
-const replyModes = { none: "不等待回执", exact: "匹配自定义回执" };
+const softwareLabels = { online: "在线", unconfirmed: "未确认", unknown: "待检测", notConfigured: "未配置", pendingTransport: "通信待接入" };
+const replyModes = { none: "不等待回执", exact: "文本完全匹配", contains: "文本包含", hex: "HEX 字节匹配" };
 const defaultLayout = { order: ["project", "workspace", "properties", "log"], sizes: {} };
 const adminActions = new Set(["rename-project", "edit-show", "add-group", "edit-group", "add-list", "edit-list",
   "add-cue", "add-target", "remove-target", "delete-cue", "up", "down", "edit-resource", "delete-resource",
-  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval"]);
+  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "cue-node-override"]);
 const scheduleModes = { weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
 const weekdays = [[1, "一"], [2, "二"], [3, "三"], [4, "四"], [5, "五"], [6, "六"], [0, "日"]];
 const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务" };
@@ -77,6 +77,43 @@ function targets(cue) {
 function responseFor(cue, target) {
   const policy = target.response ?? { mode: "exact", text: cue.reply, timeoutMs: cue.timeoutMs };
   return { ...policy, timeoutMs: policy.timeoutMs ?? 1800 };
+}
+
+function linkNodes(preferGroups = false) {
+  const nodes = new Map((preferGroups ? [] : state.project.nodeLibrary ?? []).map(node => [node.ip, node]));
+  for (const group of state.project.ipGroups)
+    group.nodes = group.nodes.map(node => {
+      if (!nodes.has(node.ip)) nodes.set(node.ip, node);
+      return nodes.get(node.ip);
+    });
+  const used = new Set(state.project.ipGroups.flatMap(group => group.nodes.map(node => node.ip)));
+  state.project.nodeLibrary = [...nodes.values()].filter(node => used.has(node.ip));
+}
+
+function replyFields(policy = { mode: "none" }, prefix = "") {
+  return field("回执匹配", prefix + "mode", policy.mode, { choices: Object.entries(replyModes) }) +
+    field("预期回执（不等待时可留空）", prefix + "text", policy.text ?? "") +
+    field("超时 (ms)", prefix + "timeoutMs", policy.timeoutMs ?? 1800, { type: "number", min: 100, max: 30000 });
+}
+
+function readReply(data, prefix = "") {
+  const mode = data.get(prefix + "mode");
+  if (mode === "none") return { mode };
+  const text = data.get(prefix + "text"), timeoutMs = Number(data.get(prefix + "timeoutMs"));
+  if (!text?.trim() || !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000)
+    throw new Error("请填写回执内容和 100–30000 ms 超时。");
+  if (mode === "hex" && !/^(?:[0-9a-fA-F]{2})+$/.test(text.replace(/\s/g, "")))
+    throw new Error("HEX 回执需要完整的十六进制字节。");
+  return { mode, text, timeoutMs };
+}
+
+function readPort(data, name, allowZero = false) {
+  const value = data.get(name)?.trim();
+  if (!value) return null;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < (allowZero ? 0 : 1) || port > 65535)
+    throw new Error("端口须为 1–65535，自动发送端口可以填 0。");
+  return port;
 }
 
 function ensureSelection() {
@@ -403,7 +440,9 @@ function renderCues() {
   const rows = list.cues.map((cue, index) => {
     const targetNames = targets(cue).map(target => state.project.ipGroups.find(item => item.id === target.ipGroupId)?.name || "未设置");
     const replyModes = new Set(targets(cue).map(target => responseFor(cue, target).mode));
-    const verification = replyModes.size > 1 ? "混合回执" : replyModes.has("exact") ? "匹配回执" : "不等回执";
+    const verification = targets(cue).some(target => target.nodeOverrides?.length) ? "逐 IP 回执"
+      : replyModes.size > 1 ? "混合回执" : replyModes.has("inherit") ? "模板回执"
+      : replyModes.has("none") ? "不等回执" : "匹配回执";
     const delay = cueWaitLabel(list, cue);
     return `<tr data-cue-row="${esc(cue.id)}" class="${cue.id === state.cueId ? "selected" : ""}"><td class="mono">${String(index + 1).padStart(2, "0")}</td>
       <td><button class="row-select" type="button" data-action="select-cue" data-id="${esc(cue.id)}">${esc(cue.name)}</button></td>
@@ -531,11 +570,12 @@ function renderProperties() {
       (selectedTemplate ? `<p class="property-help wide">模板内容 · ${esc(selectedTemplate.encoding.toUpperCase())}<br><code>${esc(selectedTemplate.payload)}</code></p>` :
         field("UDP 内容", "payload", command.payload, { wide: true, type: "textarea" }) +
         field("内容编码", "encoding", command.encoding, { choices: [["utf8", "UTF-8"], ["hex", "HEX"]] })) +
-      field("UDP 端口", "port", command.port, { type: "number", min: 1, max: 65535 }) +
-      field("回执模式", "responseMode", response.mode, { choices: Object.entries(replyModes) }) +
-      (response.mode === "exact" ? field("预期 UDP 回执", "responseText", response.text, { wide: true }) +
+      field("目标端口（留空继承）", "port", command.port ?? "", { type: "number", min: 1, max: 65535, placeholder: "模板 → 节点默认" }) +
+      field("回执模式", "responseMode", response.mode, { choices: [["inherit", "沿用命令模板"], ...Object.entries(replyModes)] }) +
+      (!["none", "inherit"].includes(response.mode) ? field("预期 UDP 回执", "responseText", response.text, { wide: true }) +
         field("回执超时 (ms)", "responseTimeout", response.timeoutMs, { type: "number", min: 100, max: 30000 }) : "") +
-      "</div></section>";
+      `</div><p class="property-help">${command.nodeOverrides?.length ?? 0} 个节点例外</p>` +
+      button("逐 IP 例外", "cue-node-override", index, "quiet") + "</section>";
   }).join("");
   const canAdd = choices.some(group => group.nodes.length && !commands.some(command => command.ipGroupId === group.id));
   $("properties").innerHTML = top + '<div id="cueForm"><div class="property-form">' +
@@ -549,7 +589,7 @@ function renderProperties() {
     field("失败策略", "onFail", cue.onFail, { choices: Object.entries(policies) }) +
     (cue.onFail === "retry" ? field("重试次数", "retries", cue.retries, { type: "number", min: 0, max: 5 }) : "") +
     '</div></div><p class="property-help">各目标组的指令可单独设置回执。ICMP Ping 检查设备可达性。重试仅重发失败节点。</p><div class="actions">' +
-    button("移除 Cue", "delete-cue", cue.id, "quiet") + "</div>";
+    button("执行预览", "dispatch-preview", cue.id, "strong") + button("移除 Cue", "delete-cue", cue.id, "quiet") + "</div>";
   if (state.access.role !== "admin")
     $("properties").querySelectorAll("input, select, textarea").forEach(input => { input.disabled = true; });
 }
@@ -594,7 +634,10 @@ function renderResource() {
       (entries.length ? "" : '<p class="empty">还没有 Action Pad 按钮。</p>') + "</div>";
   } else if (kind === "ips") {
     content = table(["分组", "节点数", "地址", "操作"], entries.map(item =>
-      `<tr><td>${esc(item.name)}</td><td>${item.nodes.length}</td><td class="mono">${esc(item.nodes.slice(0, 4).map(node => node.ip).join(" · "))}${item.nodes.length > 4 ? " …" : ""}</td><td><div class="actions">${edit(item)}${button("健康查询", "edit-ip-health", item.id, "quiet", !item.nodes.length)}</div></td></tr>`).join(""));
+      `<tr><td>${esc(item.name)}</td><td>${item.nodes.length}</td><td class="mono">${esc(item.nodes.slice(0, 4).map(node => node.ip).join(" · "))}${item.nodes.length > 4 ? " …" : ""}</td><td><div class="actions">${edit(item)}${button("健康查询", "edit-ip-health", item.id, "quiet", !item.nodes.length)}</div></td></tr>`).join("")) +
+      '<div class="node-library-head"><h2>统一节点设置</h2>' + button("批量设置", "node-batch", "", "quiet") + '</div><p class="property-help">同一 IP 在各分组共用通信与健康设置。单独设置的节点默认受批量保护。</p>' +
+      table(["IP / 名称", "所属组", "默认目标端口", "收发端口", "设置", "操作"], (state.project.nodeLibrary ?? []).map(node =>
+        `<tr><td class="mono">${esc(node.ip)}<br>${esc(node.label)}</td><td>${esc(state.project.ipGroups.filter(group => group.nodes.some(item => item.ip === node.ip)).map(group => group.name).join(" / "))}</td><td>${node.communication?.targetPort ?? "待配置"}</td><td>发送 ${node.communication?.senderPort || "自动"}<br>接收 ${node.communication?.receiverPort ?? "跟随发送"}</td><td>${node.customized ? "单独设置" : "共用设置"}</td><td>${button("通信与健康", "node-settings", node.ip, "quiet")}</td></tr>`).join(""));
   } else if (kind === "templates") {
     content = table(["模板", "编码", "指令内容", "操作"], entries.map(item =>
       `<tr><td>${esc(item.name)}</td><td>${badge(item.encoding.toUpperCase())}</td><td class="mono">${esc(item.payload.slice(0, 100))}</td><td><div class="actions">${edit(item)}</div></td></tr>`).join(""));
@@ -725,6 +768,7 @@ async function importIpLibrary(file) {
     if ($("editor").open || state.project !== project || JSON.stringify(project.ipGroups) !== original)
       throw new Error("导入期间 IP 分组库已更改。请重新选择文件导入。");
     project.ipGroups = groups;
+    linkNodes(true);
     dirty();
     render();
     notice("已合并到工程草稿，核对后点击保存项目。");
@@ -750,6 +794,10 @@ async function exportIpLibrary(format) {
 }
 
 function edit(title, fields, submit, remove, markDirty = true) {
+  $("fields").oninput = null;
+  $("editor").classList.remove("wide-editor");
+  $("editForm").querySelector('[type="submit"]').textContent = "应用";
+  $("cancelEdit").hidden = false;
   state.editor = submit;
   state.editorMarksDirty = markDirty;
   $("editTitle").textContent = title;
@@ -800,7 +848,9 @@ function editResource(id) {
       item?.nodes.map(node => [node.ip, node.label, node.simulation].join(", ")).join("\n"), { type: "textarea" });
   } else if (kind === "templates") {
     fields += field("内容编码", "encoding", item?.encoding ?? "utf8", { choices: [["utf8", "UTF-8"], ["hex", "HEX"]] }) +
-      field("UDP 指令", "payload", item?.payload, { type: "textarea", required: true });
+      field("UDP 指令", "payload", item?.payload, { type: "textarea", required: true }) +
+      field("目标端口（留空沿用节点）", "templatePort", item?.port ?? "", { type: "number", min: 1, max: 65535 }) +
+      replyFields(item?.response ?? { mode: "none" }, "templateReply-");
   } else {
     if (kind === "pads")
       fields += field("按钮动作", "padAction", item?.action ?? "play", { choices: [["play", "播放 Cue 列表"], ["stopAll", "全部停止"]] });
@@ -821,10 +871,13 @@ function editResource(id) {
         const [ip, label = "", simulation = "ok", ...extra] = line.split(",").map(value => value.trim());
         if (!ip || extra.length || !["ok", "pingFail", "timeout"].includes(simulation))
           throw new Error("节点格式为 IP, 名称, 模拟。模拟值可省略。");
-        return { ip, label, simulation, healthQuery: item?.nodes.find(node => node.ip === ip)?.healthQuery ?? null };
+        const previous = state.project.nodeLibrary?.find(node => node.ip === ip);
+        return previous ?? { ip, label, simulation, healthQuery: null };
       });
     } else if (kind === "templates") {
       Object.assign(next, { payload: data.get("payload"), encoding: data.get("encoding") });
+      next.port = readPort(data, "templatePort");
+      next.response = readReply(data, "templateReply-");
     } else {
       next.listId = data.get("listId");
       if (kind === "pads") {
@@ -844,6 +897,15 @@ function editResource(id) {
     }
     if (item) Object.assign(item, next);
     else entries.push(next);
+    if (kind === "ips") {
+      const nodes = new Set(next.nodes.map(node => node.ip));
+      for (const row of lists())
+        for (const cue of row.list.cues)
+          for (const target of targets(cue))
+            if (target.ipGroupId === next.id)
+              target.nodeOverrides = (target.nodeOverrides ?? []).filter(custom => nodes.has(custom.ip));
+      linkNodes();
+    }
   });
   if (kind === "schedules") {
     $("fields").querySelector('[name="mode"]').addEventListener("change", event => {
@@ -859,40 +921,7 @@ function editResource(id) {
 
 function editIpHealth(id) {
   const group = state.project.ipGroups.find(item => item.id === id);
-  if (!group?.nodes.length) return;
-  const allNodes = state.project.ipGroups.flatMap(item => item.nodes);
-  const queryFor = ip => allNodes.find(node => node.ip === ip && node.healthQuery)?.healthQuery;
-  const options = ip => {
-    const query = queryFor(ip);
-    return field("健康模式", "healthMode", query ? "udp" : "ping", {
-      choices: [["ping", "仅 Ping"], ["udp", "Ping + UDP 软件回执"]]
-    }) + `<div id="queryFields" class="property-form"${query ? "" : " hidden"}>` +
-      field("查询端口", "port", query?.port, { type: "number", min: 1, max: 65535 }) +
-      field("预期回执", "reply", query?.reply ?? "IMOK") +
-      field("专用查询指令（UTF-8）", "payload", query?.payload ?? "ping", { type: "textarea", wide: true }) + "</div>";
-  };
-  edit("节点健康查询", field("IP 地址", "ip", group.nodes[0].ip, {
-    choices: group.nodes.map(node => [node.ip, node.label ? `${node.ip} · ${node.label}` : node.ip])
-  }) + '<div id="healthQueryOptions">' + options(group.nodes[0].ip) +
-    '</div><p class="property-help">使用设备协议约定的状态查询指令。设置应用到所有包含该 IP 的分组。</p>', data => {
-      const ip = data.get("ip");
-      let query = null;
-      if (data.get("healthMode") === "udp") {
-        const port = Number(data.get("port"));
-        const payload = data.get("payload");
-        const reply = data.get("reply");
-        if (!Number.isInteger(port) || port < 1 || port > 65535 || !payload.trim() || !reply.trim())
-          throw new Error("请填写有效的端口、专用查询指令和预期回执。");
-        query = { port, payload, reply };
-      }
-      allNodes.filter(node => node.ip === ip).forEach(node => { node.healthQuery = query; });
-    });
-  $("fields").querySelector('[name="ip"]').addEventListener("change", event => {
-    $("healthQueryOptions").innerHTML = options(event.target.value);
-  });
-  $("healthQueryOptions").addEventListener("change", event => {
-    if (event.target.name === "healthMode") $("queryFields").hidden = event.target.value !== "udp";
-  });
+  if (group?.nodes.length) editNodeSettings(null, group);
 }
 
 function deleteResource(id) {
@@ -901,13 +930,138 @@ function deleteResource(id) {
   const item = entries.find(entry => entry.id === id);
   const key = kind === "ips" ? "ipGroupId" : "templateId";
   if ((kind === "ips" || kind === "templates") &&
-      lists().some(row => row.list.cues.some(cue => targets(cue).some(target => target[key] === id))))
+      lists().some(row => row.list.cues.some(cue => targets(cue).some(target =>
+        target[key] === id || (kind === "templates" && target.nodeOverrides?.some(custom => custom.templateId === id))))))
     throw new Error("该资源仍被 Cue 引用。");
   if (confirm(`移除「${item.name}」？`)) {
     entries.splice(entries.indexOf(item), 1);
     dirty();
     render();
   }
+}
+
+function editNodeSettings(ip, group = null) {
+  const single = ip ? state.project.nodeLibrary.find(node => node.ip === ip) : null;
+  const defaults = single ?? {};
+  const query = defaults.healthQuery;
+  const setting = (key, label, value, options = {}) =>
+    field("修改此项", "apply-" + key, !!single, { type: "checkbox" }) + field(label, key, value, options);
+  const fields = (single ? `<p class="property-help">${esc(single.ip)}，设置同步到所有所属组。</p>` + field("节点名称", "nodeLabel", single.label) :
+    field("IP 范围或地址（每行一个，留空为全部节点）", "scope", group?.nodes.map(node => node.ip).join("\n") ?? "", { type: "textarea", placeholder: "192.168.1.10-192.168.1.30" }) +
+    field("覆盖已单独设置的节点", "overwriteCustom", false, { type: "checkbox" })) +
+    setting("targetPort", "默认目标端口（留空表示未设置）", defaults.communication?.targetPort ?? "", { type: "number", min: 1, max: 65535 }) +
+    setting("senderPort", "本机发送端口（0 或留空为自动）", defaults.communication?.senderPort ?? 0, { type: "number", min: 0, max: 65535 }) +
+    setting("receiverPort", "独立接收端口（留空跟随发送端口）", defaults.communication?.receiverPort ?? "", { type: "number", min: 1, max: 65535 }) +
+    '<p class="property-help">固定发送端口和独立接收端口目前用于配置与模拟预览，真实发送将在统一收发引擎接入后启用。</p>' +
+    setting("pingEnabled", "网络 ICMP Ping", defaults.pingEnabled !== false, { type: "checkbox" }) +
+    field("修改软件健康查询", "apply-health", !!single, { type: "checkbox" }) +
+    field("启用 UDP 软件心跳（独立于网络 Ping）", "healthEnabled", !!query, { type: "checkbox" }) +
+    field("查询目标端口", "queryPort", query?.port ?? 7000, { type: "number", min: 1, max: 65535 }) +
+    field("查询指令（UTF-8）", "queryPayload", query?.payload ?? "ping", { type: "textarea" }) +
+    field("查询回执匹配", "queryMatch", query?.match ?? "exact", { choices: Object.entries(replyModes).filter(([mode]) => mode !== "none") }) +
+    field("查询预期回执", "queryReply", query?.reply ?? "IMOK") +
+    field("查询超时 (ms)", "queryTimeout", query?.timeoutMs ?? 800, { type: "number", min: 100, max: 30000 }) +
+    '<div id="nodeBatchPreview" class="wide"></div>';
+  function changes(data) {
+    const selected = single ? [single] : scopedNodes(data.get("scope"));
+    const editable = selected.filter(node => single || !node.customized || data.has("overwriteCustom"));
+    const keys = ["targetPort", "senderPort", "receiverPort", "pingEnabled", "health"].filter(key => data.has("apply-" + key));
+    return { selected, editable, keys };
+  }
+  edit(single ? "节点通信与健康设置" : "批量节点设置", fields, data => {
+    const { selected, editable, keys } = changes(data);
+    if (!selected.length || !editable.length) throw new Error("没有可修改节点，请检查范围或单独设置保护。");
+    if (!keys.length && !single) throw new Error("请勾选需要修改的字段。");
+    const communication = {};
+    for (const key of keys.filter(key => key.endsWith("Port"))) communication[key] = readPort(data, key, key === "senderPort");
+    if ("senderPort" in communication) communication.senderPort ??= 0;
+    let healthQuery = null;
+    const label = single ? data.get("nodeLabel").trim() : null;
+    if (label?.length > 80) throw new Error("节点名称不能超过 80 个字符。");
+    if (keys.includes("health") && data.has("healthEnabled")) {
+      const port = readPort(data, "queryPort"), payload = data.get("queryPayload");
+      const policy = readReply(new Map([["mode", data.get("queryMatch")], ["text", data.get("queryReply")], ["timeoutMs", data.get("queryTimeout")]]));
+      if (!port || !payload?.trim()) throw new Error("启用心跳时请填写查询端口和指令。");
+      healthQuery = { port, payload, reply: policy.text, match: policy.mode, timeoutMs: policy.timeoutMs };
+    }
+    for (const node of editable) {
+      if (single) node.label = label;
+      if (Object.keys(communication).length) node.communication = { ...node.communication, ...communication };
+      if (keys.includes("pingEnabled")) node.pingEnabled = data.has("pingEnabled");
+      if (keys.includes("health")) node.healthQuery = healthQuery;
+      node.customized = !!single;
+    }
+  });
+  const preview = () => {
+    try {
+      const { selected, editable, keys } = changes(new FormData($("editForm")));
+      const selectedIps = new Set(editable.map(node => node.ip));
+      $("nodeBatchPreview").innerHTML = `<p>选中 ${selected.length} · 将修改 ${keys.length ? editable.length : 0} · 单独设置保护 ${selected.length - editable.length}</p>` +
+        table(["IP", "结果"], selected.map(node => `<tr><td>${esc(node.ip)}</td><td>${!selectedIps.has(node.ip) ? "保留单独设置" : keys.length ? "将修改 " + keys.map(key => ({ targetPort: "目标端口", senderPort: "发送端口", receiverPort: "接收端口", pingEnabled: "网络检测", health: "软件查询" })[key]).join(" / ") : "尚未勾选字段"}</td></tr>`).join(""));
+    } catch (error) { $("nodeBatchPreview").textContent = error.message; }
+  };
+  $("fields").oninput = preview;
+  preview();
+}
+
+function scopedNodes(input) {
+  if (!input?.trim()) return state.project.nodeLibrary;
+  const selected = new Set();
+  const number = ip => {
+    const parts = ip.split(".");
+    if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255))
+      throw new Error("地址范围请使用完整 IPv4，例如 192.168.1.10-192.168.1.30。");
+    return parts.reduce((total, part) => total * 256 + Number(part), 0);
+  };
+  for (const line of input.split(/[\n,;]+/).map(value => value.trim()).filter(Boolean)) {
+    if (!line.includes("-")) {
+      const node = state.project.nodeLibrary.find(node => node.ip === line);
+      if (!node) throw new Error("节点库中没有 " + line);
+      selected.add(node);
+    } else {
+      const parts = line.split("-").map(value => value.trim());
+      if (parts.length !== 2) throw new Error("IP 范围格式无效。");
+      const start = number(parts[0]), end = number(parts[1]);
+      if (end < start) throw new Error("IP 范围结束地址应大于等于起始地址。");
+      state.project.nodeLibrary.filter(node => !node.ip.includes(":"))
+        .filter(node => number(node.ip) >= start && number(node.ip) <= end).forEach(node => selected.add(node));
+    }
+  }
+  return [...selected];
+}
+
+function editCueNodeOverride(index) {
+  const cue = selectedCue(), target = targets(cue)[index];
+  const group = state.project.ipGroups.find(group => group.id === target.ipGroupId);
+  if (!group?.nodes.length) throw new Error("请先配置目标组节点。");
+  const fields = ip => {
+    const custom = target.nodeOverrides?.find(item => item.ip === ip);
+    return field("单独指定命令模板", "templateId", custom?.templateId ?? "", { choices: [["", "沿用目标组命令"], ...state.project.templates.map(item => [item.id, item.name])] }) +
+      field("单独目标端口（留空继承）", "overridePort", custom?.port ?? "", { type: "number", min: 1, max: 65535 }) +
+      field("单独设置回执", "overrideReply", !!custom?.response, { type: "checkbox" }) + replyFields(custom?.response) +
+      field("移除此 IP 的全部例外", "clearOverride", false, { type: "checkbox" });
+  };
+  edit("Cue 逐 IP 例外", field("节点 IP", "ip", group.nodes[0].ip, { choices: group.nodes.map(node => [node.ip, node.ip + " · " + node.label]) }) +
+    '<div id="overrideFields">' + fields(group.nodes[0].ip) + '</div>', data => {
+      const ip = data.get("ip"), clear = data.has("clearOverride");
+      const port = clear ? null : readPort(data, "overridePort");
+      const response = !clear && data.has("overrideReply") ? readReply(data) : null;
+      const next = (target.nodeOverrides ?? []).filter(item => item.ip !== ip);
+      const templateId = data.get("templateId") || null;
+      if (!data.has("clearOverride") && (templateId || port || response)) next.push({ ip, templateId, port, response });
+      target.nodeOverrides = next;
+    });
+  $("fields").querySelector('[name="ip"]').addEventListener("change", event => { $("overrideFields").innerHTML = fields(event.target.value); });
+}
+
+async function showDispatchPreview(id) {
+  const rows = await request("/dispatch-preview", "POST", { project: state.project, cueId: id });
+  edit("Cue 执行预览", '<p class="property-help">按当前草稿解析。来源优先级为 Cue 节点例外 → Cue 目标组 → 模板 → 节点默认值。此操作不发送数据。</p>' +
+    table(["目标组 / IP", "发送内容 / 来源", "目标端口 / 来源", "本机发送 / 接收", "预期回执 / 来源"], rows.map(row =>
+      `<tr><td>${esc(row.group)}<br><code>${esc(row.node.ip)}</code></td><td><pre>${esc(row.payload)}</pre>${esc(row.encoding)} · ${esc(row.commandSource)}</td><td>${row.port}<br>${esc(row.portSource)}</td><td>${row.senderPort || "自动"} / ${row.receiverPort ?? "跟随发送"}${row.requiresListener ? '<br><span class="badge warn">待接入统一收发 · 仅模拟</span>' : ""}</td><td>${esc(replyModes[row.response.mode])}<pre>${esc(row.response.text ?? "")}</pre>${row.response.mode === "none" ? "" : row.response.timeoutMs + " ms · "}${esc(row.responseSource)}</td></tr>`).join("")), () => {}, null, false);
+  $("editor").classList.add("wide-editor");
+  $("editForm").querySelector('[type="submit"]').textContent = "关闭";
+  $("cancelEdit").hidden = true;
 }
 
 async function run(path) {
@@ -1053,6 +1207,10 @@ async function act(action, id, target) {
   }
   else if (action === "fire-pad") return project.pads.find(pad => pad.id === id)?.action === "stopAll" ? stopAll() : run("/pad/" + id);
   else if (action === "edit-ip-health") return editIpHealth(id);
+  else if (action === "node-settings") return editNodeSettings(id);
+  else if (action === "node-batch") return editNodeSettings(null);
+  else if (action === "cue-node-override") return editCueNodeOverride(Number(id));
+  else if (action === "dispatch-preview") return showDispatchPreview(id);
   else if (action === "edit-health-interval") {
     return edit("节点检测间隔", field("间隔（秒，0 为手动检测）", "seconds", project.healthPollSeconds ?? 0,
       { type: "number", min: 0, max: 3600, required: true }) +
@@ -1089,6 +1247,7 @@ async function act(action, id, target) {
 async function load() {
   const data = await request("/project");
   state.project = data.project;
+  linkNodes();
   state.revision = data.revision;
   state.dirty = false;
   [state.health, state.layout] = await Promise.all([request("/health"), request("/layout")]);
@@ -1187,7 +1346,8 @@ document.addEventListener("input", event => {
       return;
     }
     entry[target.name] = target.type === "checkbox" ? target.checked : target.type === "number"
-      ? (target.valueAsNumber || 0) : target.name === "templateId" ? (target.value || null) : target.value;
+      ? (target.name === "port" && target.value === "" ? null : target.valueAsNumber || 0)
+      : target.name === "templateId" ? (target.value || null) : target.value;
     dirty();
     if (target.name === "name") {
       document.querySelector("#main tr.selected .row-select").textContent = cue.name;
@@ -1259,6 +1419,7 @@ $("save").addEventListener("click", async () => {
     const data = await request("/project", "PUT", { revision: state.revision, project: state.project });
     state.revision = data.revision;
     state.dirty = state.editCounter !== counter;
+    if (!state.dirty) { state.project = data.project; linkNodes(); render(); }
     notice("项目已保存。");
   } catch (error) { notice(error.message, true); }
   finally { state.saving = false; updateSave(); }

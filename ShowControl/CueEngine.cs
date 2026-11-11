@@ -44,6 +44,8 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         var list = project.Lists.FirstOrDefault(item => item.Id == listId);
         if (list is null || list.Cues.Length == 0)
             return new(false, "所选 Cue 列表没有可执行条目。");
+        if (options.Live && list.Cues.SelectMany(cue => DispatchPlan.Build(project, cue)).Any(item => item.RequiresListener))
+            return new(false, "此列表使用固定发送或独立接收端口。目前可保存和模拟预览，真实发送需接入统一收发引擎。请使用自动发送端口和原端口接收。");
 
         lock (gate)
         {
@@ -191,13 +193,9 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
     {
         var failed = 0;
         var attempts = cue.OnFail == "retry" ? 1 + cue.Retries : 1;
-        var dispatch = cue.DispatchTargets().SelectMany(target =>
-        {
-            var group = project.IpGroups.Single(item => item.Id == target.IpGroupId);
-            var template = project.Templates.FirstOrDefault(item => item.Id == target.TemplateId);
-            var bytes = ProjectRules.Packet(template?.Payload ?? target.Payload, template?.Encoding ?? target.Encoding);
-            return group.Nodes.Select(node => new Dispatch(group.Name, node, ProjectRules.ParseIp(node.Ip), target.Port, bytes, target.Response!));
-        }).GroupBy(item => (item.Address, item.Port)).ToArray();
+        var dispatch = DispatchPlan.Build(project, cue).Select(item => new Dispatch(item.Group, item.Node,
+            ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response))
+            .GroupBy(item => (item.Address, item.Port)).ToArray();
         var router = options.Live ? new UdpNetwork.Router(project) : null;
         var waves = dispatch.GroupBy(endpoint =>
             (Adapter: router?.Select(endpoint.Key.Address), Family: endpoint.Key.Address.AddressFamily));
@@ -302,7 +300,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
                 while (true)
                 {
                     var packet = await client.ReceiveAsync(wait.Token);
-                    if (Encoding.UTF8.GetString(packet.Buffer).Trim() != expected)
+                    if (!DispatchPlan.Matches(packet.Buffer, response))
                         continue;
                     step("ack", $"收到 {expected}");
                     return true;
@@ -380,10 +378,13 @@ internal sealed class NodeHealth(RuntimeOptions options)
             await Parallel.ForEachAsync(nodes, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = token },
                 async (node, ct) =>
                 {
-                    var health = await Probe(node, options, ct);
+                    var health = node.PingEnabled ? await Probe(node, options, ct)
+                        : new Health(node.Ip, "unknown", null, DateTimeOffset.Now);
                     var adapter = router.Select(ProjectRules.ParseIp(node.Ip));
-                    var software = node.HealthQuery is null ? "notConfigured" : health.Status != "online"
-                        ? "unknown" : await CheckSoftware(node, adapter, ct) ? "online" : "unconfirmed";
+                    var pendingTransport = options.Live && node.Communication is { } communication &&
+                        (communication.SenderPort != 0 || communication.ReceiverPort.HasValue);
+                    var software = node.HealthQuery is null ? "notConfigured" : pendingTransport ? "pendingTransport"
+                        : await CheckSoftware(node, adapter, ct) ? "online" : "unconfirmed";
                     readings[node.Ip] = (node, adapter, health with { SoftwareStatus = software });
                 });
             current = new(false, current.Version + 1, DateTimeOffset.Now);
@@ -409,7 +410,7 @@ internal sealed class NodeHealth(RuntimeOptions options)
             return node.Simulation != "timeout";
         }
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
-        wait.CancelAfter(800);
+        wait.CancelAfter(query.TimeoutMs);
         try
         {
             var address = ProjectRules.ParseIp(node.Ip);
@@ -421,7 +422,7 @@ internal sealed class NodeHealth(RuntimeOptions options)
             while (true)
             {
                 var packet = await client.ReceiveAsync(wait.Token);
-                if (Encoding.UTF8.GetString(packet.Buffer).Trim() == query.Reply.Trim())
+                if (DispatchPlan.Matches(packet.Buffer, new(query.Match, query.Reply, query.TimeoutMs)))
                     return true;
             }
         }

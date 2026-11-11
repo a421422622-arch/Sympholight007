@@ -16,7 +16,8 @@ internal static class IpLibraryFiles
     private const int MaxWorkbookSize = 24 * 1024 * 1024;
     private const int MaxRows = 12_801;
     private static readonly string[] Headers = ["IP 分组", "IP 地址", "节点名称", "模拟状态", "分组 ID",
-        "健康模式", "查询端口", "查询指令", "预期回执"];
+        "健康模式", "查询端口", "查询指令", "预期回执", "默认目标端口", "本机发送端口", "独立接收端口",
+        "网络Ping", "回执匹配", "查询超时ms", "单独设置"];
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: true, throwOnInvalidBytes: true);
 
     public static (byte[] Content, string ContentType, string FileName) Export(IpGroup[] groups, string format)
@@ -26,7 +27,12 @@ internal static class IpLibraryFiles
             ? new[] { new[] { group.Name, "", "", "", group.Id } }
             : group.Nodes.Select(node => new[] { group.Name, node.Ip, node.Label, node.Simulation, group.Id,
                 node.HealthQuery is null ? "ping" : "udp", node.HealthQuery?.Port.ToString(CultureInfo.InvariantCulture) ?? "",
-                node.HealthQuery?.Payload ?? "", node.HealthQuery?.Reply ?? "" })));
+                node.HealthQuery?.Payload ?? "", node.HealthQuery?.Reply ?? "",
+                node.Communication?.TargetPort?.ToString(CultureInfo.InvariantCulture) ?? "",
+                node.Communication?.SenderPort.ToString(CultureInfo.InvariantCulture) ?? "0",
+                node.Communication?.ReceiverPort?.ToString(CultureInfo.InvariantCulture) ?? "",
+                node.PingEnabled ? "1" : "0", node.HealthQuery?.Match ?? "exact",
+                node.HealthQuery?.TimeoutMs.ToString(CultureInfo.InvariantCulture) ?? "800", node.Customized ? "1" : "0" })));
         return format switch
         {
             "xlsx" => (WriteWorkbook(rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "IP分组库.xlsx"),
@@ -61,6 +67,7 @@ internal static class IpLibraryFiles
     {
         var result = current.ToList();
         var matched = new HashSet<string>();
+        var updates = new Dictionary<IPAddress, Node>();
         foreach (var block in rows.GroupBy(row => row.Id.Length > 0 ? "id:" + row.Id : "name:" + row.Group))
         {
             var first = block.First();
@@ -90,7 +97,12 @@ internal static class IpLibraryFiles
                 nodes.TryGetValue(row.Ip, out var previous);
                 nodes[row.Ip] = new Node(previous?.Ip ?? row.Ip.ToString(),
                     row.Label ?? previous?.Label ?? "", row.Simulation ?? previous?.Simulation ?? "ok",
-                    row.HealthSpecified ? row.Query : previous?.HealthQuery);
+                    row.HealthSpecified ? row.Query : previous?.HealthQuery,
+                    row.CommunicationSpecified ? row.Communication : previous?.Communication,
+                    row.PingEnabled ?? previous?.PingEnabled ?? true, row.Customized ?? previous?.Customized ?? false);
+                if (updates.TryGetValue(row.Ip, out var other) && other != nodes[row.Ip])
+                    throw new ArgumentException($"第 {row.Line} 行的同一 IP 在多个分组中的节点设置不一致。");
+                updates[row.Ip] = nodes[row.Ip];
             }
             var updated = group with { Nodes = nodes.Values.ToArray() };
             if (existing is null)
@@ -98,7 +110,10 @@ internal static class IpLibraryFiles
             else
                 result[result.IndexOf(existing)] = updated;
         }
-        var groups = result.ToArray();
+        var groups = result.Select(group => group with
+        {
+            Nodes = group.Nodes.Select(node => updates.GetValueOrDefault(ProjectRules.ParseIp(node.Ip)) ?? node).ToArray()
+        }).ToArray();
         CheckGroups(groups);
         return groups;
     }
@@ -115,6 +130,13 @@ internal static class IpLibraryFiles
         var portColumn = FindColumn(header, "查询端口", "query port");
         var queryColumn = FindColumn(header, "查询指令", "query command");
         var replyColumn = FindColumn(header, "预期回执", "expected reply");
+        var targetColumn = FindColumn(header, "默认目标端口");
+        var senderColumn = FindColumn(header, "本机发送端口");
+        var receiverColumn = FindColumn(header, "独立接收端口");
+        var pingColumn = FindColumn(header, "网络Ping");
+        var matchColumn = FindColumn(header, "回执匹配");
+        var timeoutColumn = FindColumn(header, "查询超时ms");
+        var customColumn = FindColumn(header, "单独设置");
         var plainText = allowPlainText && groupColumn < 0 &&
             table.All(row => row.Cells.Skip(1).All(string.IsNullOrWhiteSpace));
         if (!plainText && (groupColumn < 0 || ipColumn < 0))
@@ -133,7 +155,9 @@ internal static class IpLibraryFiles
                 if (!int.TryParse(row.Get(portColumn), out var port) || port is < 1 or > 65535 ||
                     string.IsNullOrWhiteSpace(row.Get(queryColumn)) || string.IsNullOrWhiteSpace(row.Get(replyColumn)))
                     throw new ArgumentException($"第 {row.Line} 行的 UDP 健康模式须填写查询端口、查询指令和预期回执。");
-                query = new HealthQuery(port, row.Raw(queryColumn), row.Raw(replyColumn));
+                var match = row.Get(matchColumn);
+                var timeout = OptionalPort(timeoutColumn) ?? 800;
+                query = new HealthQuery(port, row.Raw(queryColumn), row.Raw(replyColumn), match.Length == 0 ? "exact" : match, timeout);
             }
             if (group.Length is 0 or > 80 || label.Length > 80 ||
                 simulation is not ("" or "ok" or "pingFail" or "timeout") ||
@@ -144,11 +168,29 @@ internal static class IpLibraryFiles
             {
                 return new ImportedNode(group, row.Get(idColumn), ip.Length > 0 ? ProjectRules.ParseIp(ip) : null,
                     label.Length == 0 ? null : label, simulation.Length == 0 ? null : simulation,
-                    healthMode.Length > 0, query, row.Line);
+                    healthMode.Length > 0, query, row.Line,
+                    targetColumn >= 0 || senderColumn >= 0 || receiverColumn >= 0,
+                    new NodeCommunication(OptionalPort(targetColumn), OptionalPort(senderColumn) ?? 0, OptionalPort(receiverColumn)),
+                    OptionalBool(pingColumn), OptionalBool(customColumn));
             }
             catch (ArgumentException error)
             {
                 throw new ArgumentException($"第 {row.Line} 行：{error.Message}", error);
+            }
+
+            int? OptionalPort(int column)
+            {
+                var value = row.Get(column);
+                if (value.Length == 0) return null;
+                if (!int.TryParse(value, out var number) || number is < 0 or > 65535)
+                    throw new ArgumentException($"第 {row.Line} 行包含无效端口或超时。");
+                return number;
+            }
+            bool? OptionalBool(int column)
+            {
+                var value = row.Get(column);
+                return value switch { "" => null, "1" => true, "0" => false,
+                    _ => throw new ArgumentException($"第 {row.Line} 行的开关须为 1 或 0。") };
             }
         }).ToArray();
     }
@@ -279,5 +321,6 @@ internal static class IpLibraryFiles
     }
 
     private sealed record ImportedNode(string Group, string Id, IPAddress? Ip, string? Label, string? Simulation,
-        bool HealthSpecified, HealthQuery? Query, long Line);
+        bool HealthSpecified, HealthQuery? Query, long Line, bool CommunicationSpecified, NodeCommunication Communication,
+        bool? PingEnabled, bool? Customized);
 }
