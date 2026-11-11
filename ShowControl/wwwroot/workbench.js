@@ -7,22 +7,24 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({
 const ids = () => crypto.randomUUID();
 const policies = { retry: "重试", skip: "跳过", stop: "停止列表" };
 const healthLabels = { online: "在线", offline: "离线", unknown: "待检测" };
-const softwareLabels = { online: "在线", unconfirmed: "未确认", unknown: "待检测", notConfigured: "未配置", pendingTransport: "通信待接入" };
+const softwareLabels = { online: "在线", unconfirmed: "未确认", unknown: "待检测", notConfigured: "未配置" };
 const replyModes = { none: "不等待回执", exact: "文本完全匹配", contains: "文本包含", hex: "HEX 字节匹配" };
+const stringEncodings = [["utf8", "UTF-8"], ["ascii", "ASCII"], ["gbk", "GBK / ANSI 936"], ["windows1252", "Windows-1252 / ANSI"]];
+const packetEncodings = [...stringEncodings.map(([id, name]) => [id, "String · " + name]), ["hex", "HEX · 原始字节"]];
 const defaultLayout = { order: ["project", "workspace", "properties", "log"], sizes: {} };
 const adminActions = new Set(["rename-project", "edit-show", "add-group", "edit-group", "add-list", "edit-list",
   "add-cue", "add-target", "remove-target", "delete-cue", "up", "down", "edit-resource", "delete-resource",
   "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "cue-node-override"]);
 const scheduleModes = { weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
 const weekdays = [[1, "一"], [2, "二"], [3, "三"], [4, "四"], [5, "五"], [6, "六"], [0, "日"]];
-const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务" };
+const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务", health: "软件检测", udp: "UDP 回传" };
 const playbackModes = { once: "顺序播放一次", loop: "循环播放" };
 const playbackSecondsInput = { type: "number", min: 0, max: 3600, step: 0.001 };
 const eventLabels = {
   queued: "已接收", send: "发送 UDP", ping: "Ping 检查", wait: "等待回执", ack: "已确认",
   success: "成功", failed: "失败", retry: "重试", skipped: "跳过", stopped: "停止",
   priority: "优先调度", interval: "播放间隔", adapterWait: "等待网卡", adapterReady: "网卡恢复",
-  completed: "完成", completedWithSkips: "完成 · 有跳过"
+  completed: "完成", completedWithSkips: "完成 · 有跳过", receive: "收到数据", deviceWait: "节点排队"
 };
 const state = {
   project: null, revision: 0, dirty: false, tab: "cues", listId: null, cueId: null,
@@ -30,7 +32,7 @@ const state = {
   editor: null, saving: false, editCounter: 0, stoppingRuns: new Set(), stoppingAll: false,
   countdowns: new Map(), importingIps: false, access: { configured: false, role: null },
   layout: defaultLayout, layoutSaving: false, treePage: 1, treeOpen: new Map(),
-  healthPage: 1, healthPageSize: 25, healthScan: null, healthVersion: -1, healthFetching: false
+  healthPage: 1, healthPageSize: 25, healthScan: null, healthVersion: -1, receiptVersion: -1, healthFetching: false
 };
 let noticeTimer;
 let statusRequest = 0;
@@ -92,6 +94,7 @@ function linkNodes(preferGroups = false) {
 
 function replyFields(policy = { mode: "none" }, prefix = "") {
   return field("回执匹配", prefix + "mode", policy.mode, { choices: Object.entries(replyModes) }) +
+    field("String 回执编码（HEX 匹配时忽略）", prefix + "encoding", policy.encoding ?? "utf8", { choices: stringEncodings }) +
     field("预期回执（不等待时可留空）", prefix + "text", policy.text ?? "") +
     field("超时 (ms)", prefix + "timeoutMs", policy.timeoutMs ?? 1800, { type: "number", min: 100, max: 30000 });
 }
@@ -104,7 +107,7 @@ function readReply(data, prefix = "") {
     throw new Error("请填写回执内容和 100–30000 ms 超时。");
   if (mode === "hex" && !/^(?:[0-9a-fA-F]{2})+$/.test(text.replace(/\s/g, "")))
     throw new Error("HEX 回执需要完整的十六进制字节。");
-  return { mode, text, timeoutMs };
+  return { mode, text, timeoutMs, encoding: data.get(prefix + "encoding") || "utf8" };
 }
 
 function readPort(data, name, allowZero = false) {
@@ -569,10 +572,12 @@ function renderProperties() {
       field("指令模板", "templateId", command.templateId || "", { wide: true, choices: template }) +
       (selectedTemplate ? `<p class="property-help wide">模板内容 · ${esc(selectedTemplate.encoding.toUpperCase())}<br><code>${esc(selectedTemplate.payload)}</code></p>` :
         field("UDP 内容", "payload", command.payload, { wide: true, type: "textarea" }) +
-        field("内容编码", "encoding", command.encoding, { choices: [["utf8", "UTF-8"], ["hex", "HEX"]] })) +
+        field("数据类型", "dataType", command.encoding === "hex" ? "hex" : "string", { choices: [["string", "String 文本"], ["hex", "HEX 原始字节"]] }) +
+        (command.encoding === "hex" ? "" : field("String 文本编码", "encoding", command.encoding, { choices: stringEncodings }))) +
       field("目标端口（留空继承）", "port", command.port ?? "", { type: "number", min: 1, max: 65535, placeholder: "模板 → 节点默认" }) +
       field("回执模式", "responseMode", response.mode, { choices: [["inherit", "沿用命令模板"], ...Object.entries(replyModes)] }) +
       (!["none", "inherit"].includes(response.mode) ? field("预期 UDP 回执", "responseText", response.text, { wide: true }) +
+        (response.mode === "hex" ? "" : field("String 回执编码", "responseEncoding", response.encoding ?? "utf8", { choices: stringEncodings })) +
         field("回执超时 (ms)", "responseTimeout", response.timeoutMs, { type: "number", min: 100, max: 30000 }) : "") +
       `</div><p class="property-help">${command.nodeOverrides?.length ?? 0} 个节点例外</p>` +
       button("逐 IP 例外", "cue-node-override", index, "quiet") + "</section>";
@@ -685,8 +690,9 @@ function renderHealthRows() {
   const rows = page.items.map(row => `<tr><td class="mono">${esc(row.ip)}</td><td>${esc(row.labels.join(" / ") || "—")}</td>
     <td>${esc(row.groups.map(group => group.name).join(" / "))}</td><td>${badge(healthLabels[row.status], row.status === "online" ? "good" : row.status === "offline" ? "bad" : "")}</td>
     <td>${badge(softwareLabels[row.softwareStatus], row.softwareStatus === "online" ? "good" : row.softwareStatus === "unconfirmed" ? "warn" : "")}</td>
-    <td class="mono">${row.latencyMs == null ? "—" : `${row.latencyMs} ms`}</td><td class="mono">${esc(localTime(row.checkedAt))}</td></tr>`).join("");
-  $("healthTable").innerHTML = table(["IP 地址", "节点", "所属分组", "设备状态", "软件状态", "Ping 延迟", "最后检测时间"], rows, "没有符合条件的节点。");
+    <td class="mono">${row.latencyMs == null ? "—" : `${row.latencyMs} ms`}</td><td class="mono">${esc(localTime(row.checkedAt))}</td>
+    <td class="receipt-cell">${row.latestReceipt ? `<code>${esc(row.latestReceipt.text)}</code><br><span class="dim">HEX ${esc(row.latestReceipt.hex)}<br>${esc(row.latestReceipt.ip)}:${row.latestReceipt.sourcePort} → ${esc(row.latestReceipt.localIp)}:${row.latestReceipt.localPort}<br>${esc(localTime(row.latestReceipt.at))} · ${esc(({matched:"匹配回执",mismatch:"内容不匹配",unsolicited:"主动或未关联回传"})[row.latestReceipt.disposition])}</span>` : "—"}</td></tr>`).join("");
+  $("healthTable").innerHTML = table(["IP 地址", "节点", "所属分组", "设备状态", "软件状态", "Ping 延迟", "最后检测时间", "最近回传"], rows, "没有符合条件的节点。");
   $("healthPager").innerHTML = pageControls(page, "个节点") +
     `<select id="healthPageSize" aria-label="每页节点数">${[25, 50, 100].map(size => option(size, `${size} 条 / 页`, state.healthPageSize)).join("")}</select>`;
   const all = healthRows();
@@ -705,14 +711,16 @@ function renderHealthProgress() {
   if (indicator.textContent !== label) indicator.textContent = label;
 }
 
-async function syncHealthScan(scan) {
+async function syncHealthScan(scan, receiptVersion = 0) {
   state.healthScan = scan;
   renderHealthProgress();
-  if (state.tab !== "health" || !state.access.role || !scan || scan.version === state.healthVersion || state.healthFetching) return;
+  if (state.tab !== "health" || !state.access.role || !scan ||
+      (scan.version === state.healthVersion && receiptVersion === state.receiptVersion) || state.healthFetching) return;
   state.healthFetching = true;
   try {
     state.health = await request("/health");
     state.healthVersion = scan.version;
+    state.receiptVersion = receiptVersion;
     if (state.tab === "health" && $("healthTable")) renderHealthRows();
   } catch { /* A later status poll can retry. */ }
   finally { state.healthFetching = false; }
@@ -732,9 +740,9 @@ function renderHealth() {
 }
 
 function exportHealth() {
-  const rows = [["IP 地址", "节点", "分组", "设备状态", "软件状态", "Ping 延迟 (ms)", "最后检测时间"], ...visibleNodes().map(row =>
+  const rows = [["IP 地址", "节点", "分组", "设备状态", "软件状态", "Ping 延迟 (ms)", "最后检测时间", "最近回传文本", "最近回传HEX", "回传来源端口", "回传时间"], ...visibleNodes().map(row =>
     [row.ip, row.labels.join(" / "), row.groups.map(group => group.name).join(" / "),
-      healthLabels[row.status], softwareLabels[row.softwareStatus], row.latencyMs ?? "", localTime(row.checkedAt)])];
+      healthLabels[row.status], softwareLabels[row.softwareStatus], row.latencyMs ?? "", localTime(row.checkedAt), row.latestReceipt?.text ?? "", row.latestReceipt?.hex ?? "", row.latestReceipt?.sourcePort ?? "", localTime(row.latestReceipt?.at)])];
   downloadCsv("节点状态.csv", rows);
 }
 
@@ -847,7 +855,9 @@ function editResource(id) {
     fields += field("节点（每行 IP, 名称, 模拟：ok / pingFail / timeout）", "nodes",
       item?.nodes.map(node => [node.ip, node.label, node.simulation].join(", ")).join("\n"), { type: "textarea" });
   } else if (kind === "templates") {
-    fields += field("内容编码", "encoding", item?.encoding ?? "utf8", { choices: [["utf8", "UTF-8"], ["hex", "HEX"]] }) +
+    fields += field("数据类型", "dataType", item?.encoding === "hex" ? "hex" : "string", { choices: [["string", "String 文本"], ["hex", "HEX 原始字节"]] }) +
+      '<div id="templateTextEncoding"' + (item?.encoding === "hex" ? ' hidden' : '') + '>' +
+      field("String 文本编码", "encoding", item?.encoding === "hex" ? "utf8" : item?.encoding ?? "utf8", { choices: stringEncodings }) + '</div>' +
       field("UDP 指令", "payload", item?.payload, { type: "textarea", required: true }) +
       field("目标端口（留空沿用节点）", "templatePort", item?.port ?? "", { type: "number", min: 1, max: 65535 }) +
       replyFields(item?.response ?? { mode: "none" }, "templateReply-");
@@ -875,7 +885,7 @@ function editResource(id) {
         return previous ?? { ip, label, simulation, healthQuery: null };
       });
     } else if (kind === "templates") {
-      Object.assign(next, { payload: data.get("payload"), encoding: data.get("encoding") });
+      Object.assign(next, { payload: data.get("payload"), encoding: data.get("dataType") === "hex" ? "hex" : data.get("encoding") });
       next.port = readPort(data, "templatePort");
       next.response = readReply(data, "templateReply-");
     } else {
@@ -910,6 +920,11 @@ function editResource(id) {
   if (kind === "schedules") {
     $("fields").querySelector('[name="mode"]').addEventListener("change", event => {
       $("scheduleFields").innerHTML = scheduleFields(event.target.value, item);
+    });
+  }
+  if (kind === "templates") {
+    $("fields").querySelector('[name="dataType"]').addEventListener("change", event => {
+      $("templateTextEncoding").hidden = event.target.value === "hex";
     });
   }
   if (kind === "pads") {
@@ -952,20 +967,24 @@ function editNodeSettings(ip, group = null) {
     setting("targetPort", "默认目标端口（留空表示未设置）", defaults.communication?.targetPort ?? "", { type: "number", min: 1, max: 65535 }) +
     setting("senderPort", "本机发送端口（0 或留空为自动）", defaults.communication?.senderPort ?? 0, { type: "number", min: 0, max: 65535 }) +
     setting("receiverPort", "独立接收端口（留空跟随发送端口）", defaults.communication?.receiverPort ?? "", { type: "number", min: 1, max: 65535 }) +
-    '<p class="property-help">固定发送端口和独立接收端口目前用于配置与模拟预览，真实发送将在统一收发引擎接入后启用。</p>' +
+    setting("replySourcePort", "允许的回执源端口（留空允许任意）", defaults.communication?.replySourcePort ?? "", { type: "number", min: 1, max: 65535 }) +
+    setting("receiveEncoding", "主动上报 String 显示编码", defaults.communication?.receiveEncoding ?? "utf8", { choices: stringEncodings }) +
+    '<p class="property-help">固定端口统一监听，同一 IP 的命令与软件查询排队执行。回执源端口指对方发回数据所用的端口。</p>' +
     setting("pingEnabled", "网络 ICMP Ping", defaults.pingEnabled !== false, { type: "checkbox" }) +
     field("修改软件健康查询", "apply-health", !!single, { type: "checkbox" }) +
     field("启用 UDP 软件心跳（独立于网络 Ping）", "healthEnabled", !!query, { type: "checkbox" }) +
     field("查询目标端口", "queryPort", query?.port ?? 7000, { type: "number", min: 1, max: 65535 }) +
-    field("查询指令（UTF-8）", "queryPayload", query?.payload ?? "ping", { type: "textarea" }) +
+    field("查询数据类型 / 编码", "queryEncoding", query?.encoding ?? "utf8", { choices: packetEncodings }) +
+    field("查询指令", "queryPayload", query?.payload ?? "ping", { type: "textarea" }) +
     field("查询回执匹配", "queryMatch", query?.match ?? "exact", { choices: Object.entries(replyModes).filter(([mode]) => mode !== "none") }) +
     field("查询预期回执", "queryReply", query?.reply ?? "IMOK") +
+    field("String 查询回执编码", "queryReplyEncoding", query?.replyEncoding ?? "utf8", { choices: stringEncodings }) +
     field("查询超时 (ms)", "queryTimeout", query?.timeoutMs ?? 800, { type: "number", min: 100, max: 30000 }) +
     '<div id="nodeBatchPreview" class="wide"></div>';
   function changes(data) {
     const selected = single ? [single] : scopedNodes(data.get("scope"));
     const editable = selected.filter(node => single || !node.customized || data.has("overwriteCustom"));
-    const keys = ["targetPort", "senderPort", "receiverPort", "pingEnabled", "health"].filter(key => data.has("apply-" + key));
+    const keys = ["targetPort", "senderPort", "receiverPort", "replySourcePort", "receiveEncoding", "pingEnabled", "health"].filter(key => data.has("apply-" + key));
     return { selected, editable, keys };
   }
   edit(single ? "节点通信与健康设置" : "批量节点设置", fields, data => {
@@ -975,14 +994,16 @@ function editNodeSettings(ip, group = null) {
     const communication = {};
     for (const key of keys.filter(key => key.endsWith("Port"))) communication[key] = readPort(data, key, key === "senderPort");
     if ("senderPort" in communication) communication.senderPort ??= 0;
+    if (keys.includes("receiveEncoding")) communication.receiveEncoding = data.get("receiveEncoding");
     let healthQuery = null;
     const label = single ? data.get("nodeLabel").trim() : null;
     if (label?.length > 80) throw new Error("节点名称不能超过 80 个字符。");
     if (keys.includes("health") && data.has("healthEnabled")) {
       const port = readPort(data, "queryPort"), payload = data.get("queryPayload");
-      const policy = readReply(new Map([["mode", data.get("queryMatch")], ["text", data.get("queryReply")], ["timeoutMs", data.get("queryTimeout")]]));
+      const policy = readReply(new Map([["mode", data.get("queryMatch")], ["text", data.get("queryReply")], ["timeoutMs", data.get("queryTimeout")], ["encoding", data.get("queryReplyEncoding")]]));
       if (!port || !payload?.trim()) throw new Error("启用心跳时请填写查询端口和指令。");
-      healthQuery = { port, payload, reply: policy.text, match: policy.mode, timeoutMs: policy.timeoutMs };
+      healthQuery = { port, payload, reply: policy.text, match: policy.mode, timeoutMs: policy.timeoutMs,
+        encoding: data.get("queryEncoding"), replyEncoding: policy.encoding };
     }
     for (const node of editable) {
       if (single) node.label = label;
@@ -997,7 +1018,7 @@ function editNodeSettings(ip, group = null) {
       const { selected, editable, keys } = changes(new FormData($("editForm")));
       const selectedIps = new Set(editable.map(node => node.ip));
       $("nodeBatchPreview").innerHTML = `<p>选中 ${selected.length} · 将修改 ${keys.length ? editable.length : 0} · 单独设置保护 ${selected.length - editable.length}</p>` +
-        table(["IP", "结果"], selected.map(node => `<tr><td>${esc(node.ip)}</td><td>${!selectedIps.has(node.ip) ? "保留单独设置" : keys.length ? "将修改 " + keys.map(key => ({ targetPort: "目标端口", senderPort: "发送端口", receiverPort: "接收端口", pingEnabled: "网络检测", health: "软件查询" })[key]).join(" / ") : "尚未勾选字段"}</td></tr>`).join(""));
+        table(["IP", "结果"], selected.map(node => `<tr><td>${esc(node.ip)}</td><td>${!selectedIps.has(node.ip) ? "保留单独设置" : keys.length ? "将修改 " + keys.map(key => ({ targetPort: "目标端口", senderPort: "发送端口", receiverPort: "接收端口", replySourcePort: "回执源端口", receiveEncoding: "接收编码", pingEnabled: "网络检测", health: "软件查询" })[key]).join(" / ") : "尚未勾选字段"}</td></tr>`).join(""));
     } catch (error) { $("nodeBatchPreview").textContent = error.message; }
   };
   $("fields").oninput = preview;
@@ -1058,7 +1079,7 @@ async function showDispatchPreview(id) {
   const rows = await request("/dispatch-preview", "POST", { project: state.project, cueId: id });
   edit("Cue 执行预览", '<p class="property-help">按当前草稿解析。来源优先级为 Cue 节点例外 → Cue 目标组 → 模板 → 节点默认值。此操作不发送数据。</p>' +
     table(["目标组 / IP", "发送内容 / 来源", "目标端口 / 来源", "本机发送 / 接收", "预期回执 / 来源"], rows.map(row =>
-      `<tr><td>${esc(row.group)}<br><code>${esc(row.node.ip)}</code></td><td><pre>${esc(row.payload)}</pre>${esc(row.encoding)} · ${esc(row.commandSource)}</td><td>${row.port}<br>${esc(row.portSource)}</td><td>${row.senderPort || "自动"} / ${row.receiverPort ?? "跟随发送"}${row.requiresListener ? '<br><span class="badge warn">待接入统一收发 · 仅模拟</span>' : ""}</td><td>${esc(replyModes[row.response.mode])}<pre>${esc(row.response.text ?? "")}</pre>${row.response.mode === "none" ? "" : row.response.timeoutMs + " ms · "}${esc(row.responseSource)}</td></tr>`).join("")), () => {}, null, false);
+      `<tr><td>${esc(row.group)}<br><code>${esc(row.node.ip)}</code></td><td><pre>${esc(row.payload)}</pre>${esc(row.encoding === "hex" ? "HEX" : "String · " + row.encoding)} · ${esc(row.commandSource)}</td><td>${row.port}<br>${esc(row.portSource)}</td><td>${row.senderPort || "自动"} / ${row.receiverPort ?? "跟随发送"}${row.requiresListener ? '<br><span class="badge">统一监听</span>' : ""}</td><td>${esc(replyModes[row.response.mode])}<pre>${esc(row.response.text ?? "")}</pre>${row.response.mode === "none" ? "" : row.response.timeoutMs + " ms · "}${esc(row.responseSource)}</td></tr>`).join("")), () => {}, null, false);
   $("editor").classList.add("wide-editor");
   $("editForm").querySelector('[type="submit"]').textContent = "关闭";
   $("cancelEdit").hidden = true;
@@ -1288,7 +1309,7 @@ async function poll() {
   state.countdowns = countdowns;
   state.timezone = data.timeZone;
   state.scheduleMode = data.scheduleMode ?? "weekly";
-  syncHealthScan(data.healthScan ?? null);
+  syncHealthScan(data.healthScan ?? null, data.receiptVersion ?? 0);
   $("logStorageWarning").hidden = !data.logStorageWarning;
   updateScheduleMode();
   $("mode").classList.toggle("live", data.live);
@@ -1336,10 +1357,16 @@ document.addEventListener("input", event => {
     }
     const groupCard = target.closest("[data-target]");
     const entry = groupCard ? targets(cue)[Number(groupCard.dataset.target)] : cue;
-    if (groupCard && ["responseMode", "responseText", "responseTimeout"].includes(target.name)) {
+    if (groupCard && target.name === "dataType") {
+      entry.encoding = target.value === "hex" ? "hex" : "utf8";
+      dirty();
+      return;
+    }
+    if (groupCard && ["responseMode", "responseText", "responseTimeout", "responseEncoding"].includes(target.name)) {
       const response = { ...responseFor(cue, entry) };
       if (target.name === "responseMode") response.mode = target.value;
       else if (target.name === "responseText") response.text = target.value;
+      else if (target.name === "responseEncoding") response.encoding = target.value;
       else response.timeoutMs = target.valueAsNumber || 0;
       entry.response = response;
       dirty();
@@ -1363,7 +1390,7 @@ document.addEventListener("input", event => {
 
 document.addEventListener("change", event => {
   const target = event.target;
-  if (target.closest("#cueForm") && ["templateId", "onFail", "ipGroupId", "ping", "responseMode"].includes(target.name)) {
+  if (target.closest("#cueForm") && ["templateId", "onFail", "ipGroupId", "ping", "responseMode", "dataType"].includes(target.name)) {
     renderCues();
   } else if (target.id === "healthGroup" || target.id === "healthStatus") {
     state.filters[target.id === "healthGroup" ? "group" : "status"] = target.value;

@@ -8,6 +8,9 @@ internal sealed record LogFolderStatus(string Directory, long LostEntries, strin
 
 internal sealed class ExecutionLogStore(string dataDirectory) : BackgroundService
 {
+    private readonly object recentGate = new();
+    private readonly Queue<EventEntry> recent = new();
+    public EventEntry[] Recent { get { lock (recentGate) return recent.Reverse().ToArray(); } }
     private readonly string folder = Path.GetFullPath(Path.Combine(dataDirectory, "logs"));
     private readonly Channel<EventEntry> queue = Channel.CreateBounded<EventEntry>(new BoundedChannelOptions(8192)
     {
@@ -21,6 +24,11 @@ internal sealed class ExecutionLogStore(string dataDirectory) : BackgroundServic
 
     public void Append(EventEntry entry)
     {
+        lock (recentGate)
+        {
+            if (recent.Count >= 300) recent.Dequeue();
+            recent.Enqueue(entry);
+        }
         if (!queue.Writer.TryWrite(entry))
             Interlocked.Increment(ref lostEntries);
     }

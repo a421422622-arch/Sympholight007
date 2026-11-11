@@ -59,12 +59,17 @@ internal static class DispatchPlan
             string.IsNullOrWhiteSpace(response.Text) || response.Text.Length > 120)
             throw new ArgumentException("回执需要有效的匹配方式、内容和 100–30000 ms 超时。");
         if (response.Mode == "hex") _ = ProjectRules.Packet(response.Text, "hex");
+        else _ = ProjectRules.Packet(response.Text, response.Encoding);
     }
 
-    public static bool Matches(byte[] bytes, ReplyPolicy response) => response.Mode switch
+    public static bool Matches(byte[] bytes, ReplyPolicy response)
     {
-        "hex" => bytes.AsSpan().SequenceEqual(ProjectRules.Packet(response.Text!, "hex")),
-        "contains" => Encoding.UTF8.GetString(bytes).Contains(response.Text!, StringComparison.Ordinal),
-        _ => Encoding.UTF8.GetString(bytes).Trim() == response.Text!.Trim()
-    };
+        if (response.Mode == "hex") return bytes.AsSpan().SequenceEqual(ProjectRules.Packet(response.Text!, "hex"));
+        try
+        {
+            var text = ProjectRules.TextEncoding(response.Encoding).GetString(bytes);
+            return response.Mode == "contains" ? text.Contains(response.Text!, StringComparison.Ordinal) : text.Trim() == response.Text!.Trim();
+        }
+        catch (DecoderFallbackException) { return false; }
+    }
 }

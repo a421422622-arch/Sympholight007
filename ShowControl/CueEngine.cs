@@ -7,18 +7,19 @@ using System.Text;
 namespace ShowControl;
 
 internal sealed record RuntimeOptions(bool Live);
-internal sealed record EventEntry(DateTimeOffset At, string Source, string List, string Cue, string Status, string Message);
+internal sealed record EventEntry(DateTimeOffset At, string Source, string List, string Cue, string Status, string Message,
+    UdpReceipt? Packet = null);
 internal sealed record ActiveRun(Guid Id, string ListId, string List, string Source, DateTimeOffset At,
     string PlaybackMode, string PlaybackGroup, bool Stopping = false, string? CueId = null, string? CueName = null,
     long Round = 0, bool WaitingForNext = false, string? NextCueName = null, int? RemainingWaitMs = null);
 internal sealed record TriggerResult(bool Accepted, string Message);
 internal sealed record Health(string Ip, string Status, long? LatencyMs, DateTimeOffset CheckedAt,
-    string SoftwareStatus = "notConfigured");
+    string SoftwareStatus = "notConfigured", UdpReceipt? LatestReceipt = null);
 
-internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime lifetime, ExecutionLogStore logStore)
+internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime lifetime, ExecutionLogStore logStore,
+    UdpTransport transport)
 {
     private readonly object gate = new();
-    private readonly Queue<EventEntry> events = new();
     private readonly Dictionary<string, Run> active = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim udpSlots = new(512);
 
@@ -35,7 +36,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
                     : null;
                 return info with { Stopping = stopping, RemainingWaitMs = remaining };
             }).OrderBy(run => run.At).ToArray();
-            return (runs, events.Reverse().ToArray());
+            return (runs, logStore.Recent);
         }
     }
 
@@ -44,8 +45,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         var list = project.Lists.FirstOrDefault(item => item.Id == listId);
         if (list is null || list.Cues.Length == 0)
             return new(false, "所选 Cue 列表没有可执行条目。");
-        if (options.Live && list.Cues.SelectMany(cue => DispatchPlan.Build(project, cue)).Any(item => item.RequiresListener))
-            return new(false, "此列表使用固定发送或独立接收端口。目前可保存和模拟预览，真实发送需接入统一收发引擎。请使用自动发送端口和原端口接收。");
+
 
         lock (gate)
         {
@@ -194,7 +194,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         var failed = 0;
         var attempts = cue.OnFail == "retry" ? 1 + cue.Retries : 1;
         var dispatch = DispatchPlan.Build(project, cue).Select(item => new Dispatch(item.Group, item.Node,
-            ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response))
+            ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response, item.Encoding))
             .GroupBy(item => (item.Address, item.Port)).ToArray();
         var router = options.Live ? new UdpNetwork.Router(project) : null;
         var waves = dispatch.GroupBy(endpoint =>
@@ -227,7 +227,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
                         var binding = adapter is null || firstSend ? initialBinding : await UdpNetwork.Wait(adapter, family, null, ct);
                         firstSend = false;
                         await udpSlots.WaitAsync(ct);
-                        try { confirmed = await Send(cue, item, binding, Step, ct); }
+                        try { confirmed = await Send(cue, item, binding, new(source, list.Name, cue.Name, item.Group), Step, ct); }
                         finally { udpSlots.Release(); }
                     }
                     if (!confirmed)
@@ -251,85 +251,54 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         }
     }
 
-    private sealed record Dispatch(string Group, Node Node, System.Net.IPAddress Address, int Port, byte[] Bytes, ReplyPolicy Response);
+    private sealed record Dispatch(string Group, Node Node, System.Net.IPAddress Address, int Port, byte[] Bytes, ReplyPolicy Response, string Encoding);
 
-    private async Task<bool> Send(Cue cue, Dispatch item, UdpNetwork.Binding? binding, Action<string, string> step, CancellationToken token)
+    private async Task<bool> Send(Cue cue, Dispatch item, UdpNetwork.Binding? binding, UdpContext context,
+        Action<string, string> step, CancellationToken token)
     {
         try
         {
+            if (options.Live)
+                return await transport.Exchange(item.Address, item.Port, item.Bytes, item.Encoding,
+                    item.Node.Communication, binding, item.Response, context, step, cue.Ping ? CheckPing : null, token);
             token.ThrowIfCancellationRequested();
-            using var client = options.Live ? UdpNetwork.Connect(item.Address, item.Port, binding) : null;
-            if (client is not null)
-            {
-                await client.SendAsync(item.Bytes.AsMemory(), token);
-            }
             var response = item.Response;
-            step("send", $"{(options.Live ? "已发送" : "模拟发送")} {item.Bytes.Length} 字节 UDP" +
+            step("send", $"模拟发送 {item.Bytes.Length} 字节 UDP" +
                 (response.Mode == "none" ? " · 不等待回执" : ""));
-            if (cue.Ping)
+            if (cue.Ping && !await CheckPing(token)) return false;
+            if (response.Mode == "none") return true;
+            step("wait", $"等待回执 {response.Text}");
+            await Task.Delay(item.Node.Simulation == "timeout" ? response.TimeoutMs : 140, token);
+            if (item.Node.Simulation == "timeout")
             {
-                step("ping", "检查 ICMP Ping");
-                if ((await NodeHealth.Probe(item.Node, options, token)).Status != "online")
-                {
-                    step("failed", "Ping 失败");
-                    return false;
-                }
-            }
-
-            if (response.Mode == "none")
-                return true;
-
-            var expected = response.Text!.Trim();
-            step("wait", $"等待回执 {expected}");
-            if (client is null)
-            {
-                await Task.Delay(item.Node.Simulation == "timeout" ? response.TimeoutMs : 140, token);
-                if (item.Node.Simulation == "timeout")
-                {
-                    step("failed", $"等待回执 {expected} 超时");
-                    return false;
-                }
-                step("ack", $"模拟收到 {expected}");
-                return true;
-            }
-
-            using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
-            wait.CancelAfter(response.TimeoutMs);
-            try
-            {
-                while (true)
-                {
-                    var packet = await client.ReceiveAsync(wait.Token);
-                    if (!DispatchPlan.Matches(packet.Buffer, response))
-                        continue;
-                    step("ack", $"收到 {expected}");
-                    return true;
-                }
-            }
-            catch (OperationCanceledException) when (!token.IsCancellationRequested)
-            {
-                step("failed", $"等待回执 {expected} 超时");
+                step("failed", $"等待回执 {response.Text} 超时");
                 return false;
             }
+            step("ack", $"模拟收到 {response.Text}");
+            return true;
         }
         catch (SocketException error)
         {
             step("failed", $"UDP 错误 {error.SocketErrorCode}");
             return false;
         }
-    }
-
-    private void Log(string source, string list, string cue, string status, string message)
-    {
-        lock (gate)
+        catch (IOException error)
         {
-            if (events.Count >= 300)
-                events.Dequeue();
-            var entry = new EventEntry(DateTimeOffset.Now, source, list, cue, status, message);
-            events.Enqueue(entry);
-            logStore.Append(entry);
+            step("failed", error.Message);
+            return false;
+        }
+
+        async Task<bool> CheckPing(CancellationToken ct)
+        {
+            step("ping", "检查 ICMP Ping");
+            var ok = (await NodeHealth.Probe(item.Node, options, ct)).Status == "online";
+            if (!ok) step("failed", "Ping 失败");
+            return ok;
         }
     }
+
+    private void Log(string source, string list, string cue, string status, string message) =>
+        logStore.Append(new(DateTimeOffset.Now, source, list, cue, status, message));
 
     private sealed class Run(ActiveRun info, CancellationTokenSource cancel)
     {
@@ -340,7 +309,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
     }
 }
 
-internal sealed class NodeHealth(RuntimeOptions options)
+internal sealed class NodeHealth(RuntimeOptions options, UdpTransport transport, ExecutionLogStore logStore)
 {
     private readonly ConcurrentDictionary<string, (Node Node, string? Adapter, Health Health)> readings = new();
     private readonly SemaphoreSlim refresh = new(1);
@@ -350,9 +319,9 @@ internal sealed class NodeHealth(RuntimeOptions options)
     public Health[] Get(Project project)
     {
         var router = new UdpNetwork.Router(project);
-        return Nodes(project).Select(node => readings.TryGetValue(node.Ip, out var value) && value.Node == node &&
+        return Nodes(project).Select(node => (readings.TryGetValue(node.Ip, out var value) && value.Node == node &&
             value.Adapter == router.Select(ProjectRules.ParseIp(node.Ip))
-            ? value.Health : new Health(node.Ip, "unknown", null, default, node.HealthQuery is null ? "notConfigured" : "unknown")).ToArray();
+            ? value.Health : new Health(node.Ip, "unknown", null, default, node.HealthQuery is null ? "notConfigured" : "unknown")) with { LatestReceipt = transport.Latest(node.Ip) }).ToArray();
     }
 
     public async Task<Health[]> Refresh(Project project, CancellationToken token, bool automatic = false)
@@ -381,9 +350,7 @@ internal sealed class NodeHealth(RuntimeOptions options)
                     var health = node.PingEnabled ? await Probe(node, options, ct)
                         : new Health(node.Ip, "unknown", null, DateTimeOffset.Now);
                     var adapter = router.Select(ProjectRules.ParseIp(node.Ip));
-                    var pendingTransport = options.Live && node.Communication is { } communication &&
-                        (communication.SenderPort != 0 || communication.ReceiverPort.HasValue);
-                    var software = node.HealthQuery is null ? "notConfigured" : pendingTransport ? "pendingTransport"
+                    var software = node.HealthQuery is null ? "notConfigured"
                         : await CheckSoftware(node, adapter, ct) ? "online" : "unconfirmed";
                     readings[node.Ip] = (node, adapter, health with { SoftwareStatus = software });
                 });
@@ -409,24 +376,18 @@ internal sealed class NodeHealth(RuntimeOptions options)
             await Task.Delay(70, token);
             return node.Simulation != "timeout";
         }
-        using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
-        wait.CancelAfter(query.TimeoutMs);
         try
         {
             var address = ProjectRules.ParseIp(node.Ip);
             var binding = adapter is null ? null : UdpNetwork.Resolve(adapter, address.AddressFamily);
-            if (adapter is not null && binding is null)
-                return false;
-            using var client = UdpNetwork.Connect(address, query.Port, binding);
-            await client.SendAsync(Encoding.UTF8.GetBytes(query.Payload).AsMemory(), wait.Token);
-            while (true)
-            {
-                var packet = await client.ReceiveAsync(wait.Token);
-                if (DispatchPlan.Matches(packet.Buffer, new(query.Match, query.Reply, query.TimeoutMs)))
-                    return true;
-            }
+            if (adapter is not null && binding is null) return false;
+            return await transport.Exchange(address, query.Port, ProjectRules.Packet(query.Payload, query.Encoding),
+                query.Encoding, node.Communication, binding, new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding),
+                new("health", "", "软件健康查询", node.Label),
+                (status, message) => logStore.Append(new(DateTimeOffset.Now, "health", "", "软件健康查询", status,
+                    $"{node.Label} · {node.Ip}:{query.Port} · {message}")), null, token);
         }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested) { return false; }
+        catch (IOException) { return false; }
         catch (SocketException) { return false; }
     }
 

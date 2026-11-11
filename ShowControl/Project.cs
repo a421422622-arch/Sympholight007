@@ -37,12 +37,14 @@ internal sealed record Cue(string Id, string Name, string IpGroupId, string? Tem
 internal sealed record CueTarget(string IpGroupId, string? TemplateId, string Payload, string Encoding, int? Port,
     ReplyPolicy? Response = null, NodeCommandOverride[]? NodeOverrides = null);
 internal sealed record NodeCommandOverride(string Ip, string? TemplateId = null, int? Port = null, ReplyPolicy? Response = null);
-internal sealed record ReplyPolicy(string Mode, string? Text = null, int TimeoutMs = 1800);
+internal sealed record ReplyPolicy(string Mode, string? Text = null, int TimeoutMs = 1800, string Encoding = "utf8");
 internal sealed record IpGroup(string Id, string Name, Node[] Nodes);
 internal sealed record Node(string Ip, string Label, string Simulation, HealthQuery? HealthQuery = null,
     NodeCommunication? Communication = null, bool PingEnabled = true, bool Customized = false);
-internal sealed record NodeCommunication(int? TargetPort = null, int SenderPort = 0, int? ReceiverPort = null);
-internal sealed record HealthQuery(int Port, string Payload, string Reply, string Match = "exact", int TimeoutMs = 800);
+internal sealed record NodeCommunication(int? TargetPort = null, int SenderPort = 0, int? ReceiverPort = null,
+    int? ReplySourcePort = null, string ReceiveEncoding = "utf8");
+internal sealed record HealthQuery(int Port, string Payload, string Reply, string Match = "exact", int TimeoutMs = 800,
+    string Encoding = "utf8", string ReplyEncoding = "utf8");
 internal sealed record CommandTemplate(string Id, string Name, string Payload, string Encoding,
     ReplyPolicy? Response = null, int? Port = null);
 internal sealed record Schedule(string Id, string Name, string ListId, string At, bool Enabled,
@@ -52,6 +54,15 @@ internal sealed record Snapshot(long Revision, Project Project);
 
 internal static class ProjectRules
 {
+    static ProjectRules() => Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+    public static Encoding TextEncoding(string encoding) => encoding switch
+    {
+        "utf8" => new UTF8Encoding(false, true),
+        "ascii" => Encoding.GetEncoding(20127, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback),
+        "gbk" => Encoding.GetEncoding(936, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback),
+        "windows1252" => Encoding.GetEncoding(1252, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback),
+        _ => throw new ArgumentException("String 编码须为 UTF-8、ASCII、GBK 或 Windows-1252。")
+    };
     private const int MaxIntervalMs = 3_600_000;
 
     public static void Check(Project project)
@@ -95,14 +106,15 @@ internal static class ProjectRules
                     throw new ArgumentException($"IP 分组「{group.Name}」包含重复节点或无效配置。");
                 if (node.Communication is { } communication &&
                     (communication.TargetPort is < 1 or > 65535 || communication.SenderPort is < 0 or > 65535 ||
-                        communication.ReceiverPort is < 1 or > 65535))
+                        communication.ReceiverPort is < 1 or > 65535 || communication.ReplySourcePort is < 1 or > 65535))
                     throw new ArgumentException($"节点「{node.Ip}」的通信端口无效。");
+                if (node.Communication is { } settings) _ = TextEncoding(settings.ReceiveEncoding);
                 if (node.HealthQuery is { } query)
                 {
                     if (query.Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(query.Reply) || query.Reply.Length > 120)
                         throw new ArgumentException($"节点「{node.Ip}」的健康查询端口或回执无效。");
-                    _ = Packet(query.Payload, "utf8");
-                    DispatchPlan.CheckResponse(new(query.Match, query.Reply, query.TimeoutMs));
+                    _ = Packet(query.Payload, query.Encoding);
+                    DispatchPlan.CheckResponse(new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding));
                     if (query.Match == "none") throw new ArgumentException("软件健康查询需要匹配回执。");
                     if (queries.TryGetValue(address, out var previous) && previous != query)
                         throw new ArgumentException($"节点「{node.Ip}」在多个分组中的健康查询设置不一致。");
@@ -231,21 +243,24 @@ internal static class ProjectRules
 
     public static byte[] Packet(string value, string encoding)
     {
-        if (string.IsNullOrWhiteSpace(value) || value.Length > 6000)
+        if (string.IsNullOrEmpty(value) || value.Length > 6000)
             throw new ArgumentException("UDP 指令为空或过长。");
         byte[] bytes;
         try
         {
             bytes = encoding switch
             {
-                "utf8" => Encoding.UTF8.GetBytes(value),
                 "hex" => Convert.FromHexString(string.Concat(value.Where(ch => !char.IsWhiteSpace(ch)))),
-                _ => throw new ArgumentException("UDP 指令编码须为 UTF-8 或 HEX。")
+                _ => TextEncoding(encoding).GetBytes(value)
             };
         }
         catch (FormatException)
         {
             throw new ArgumentException("HEX 指令需要完整的十六进制字节。");
+        }
+        catch (EncoderFallbackException)
+        {
+            throw new ArgumentException("String 内容包含所选编码无法表示的字符，请检查编码设置。");
         }
         if (bytes.Length is < 1 or > 1400)
             throw new ArgumentException("UDP 指令须为 1–1400 字节。");

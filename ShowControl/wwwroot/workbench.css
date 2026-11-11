@@ -188,6 +188,8 @@ dialog footer { justify-content: end; gap: 7px; border-bottom: 0; border-top: 1p
 #editor pre { margin: 3px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 #overrideFields { display: grid; gap: 10px; }
 .node-library-head { margin-top: 22px; display: flex; align-items: center; justify-content: space-between; }
+.receipt-cell { min-width: 200px; max-width: 360px; white-space: normal; overflow-wrap: anywhere; }
+.receipt-cell code { white-space: pre-wrap; }
 #nodeBatchPreview .table-box { max-height: 180px; overflow: auto; }
 #fields:has(#udpRoutes) { max-height: min(62vh, 570px); overflow: auto; }
 #fields:has(#udpRoutes) > .table-box { max-height: 150px; }

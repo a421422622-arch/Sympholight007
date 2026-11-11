@@ -17,7 +17,7 @@ internal static class IpLibraryFiles
     private const int MaxRows = 12_801;
     private static readonly string[] Headers = ["IP 分组", "IP 地址", "节点名称", "模拟状态", "分组 ID",
         "健康模式", "查询端口", "查询指令", "预期回执", "默认目标端口", "本机发送端口", "独立接收端口",
-        "网络Ping", "回执匹配", "查询超时ms", "单独设置"];
+        "网络Ping", "回执匹配", "查询超时ms", "单独设置", "回执源端口", "接收编码", "查询编码", "查询回执编码"];
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: true, throwOnInvalidBytes: true);
 
     public static (byte[] Content, string ContentType, string FileName) Export(IpGroup[] groups, string format)
@@ -32,7 +32,9 @@ internal static class IpLibraryFiles
                 node.Communication?.SenderPort.ToString(CultureInfo.InvariantCulture) ?? "0",
                 node.Communication?.ReceiverPort?.ToString(CultureInfo.InvariantCulture) ?? "",
                 node.PingEnabled ? "1" : "0", node.HealthQuery?.Match ?? "exact",
-                node.HealthQuery?.TimeoutMs.ToString(CultureInfo.InvariantCulture) ?? "800", node.Customized ? "1" : "0" })));
+                node.HealthQuery?.TimeoutMs.ToString(CultureInfo.InvariantCulture) ?? "800", node.Customized ? "1" : "0",
+                node.Communication?.ReplySourcePort?.ToString(CultureInfo.InvariantCulture) ?? "", node.Communication?.ReceiveEncoding ?? "utf8",
+                node.HealthQuery?.Encoding ?? "utf8", node.HealthQuery?.ReplyEncoding ?? "utf8" })));
         return format switch
         {
             "xlsx" => (WriteWorkbook(rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "IP分组库.xlsx"),
@@ -133,6 +135,10 @@ internal static class IpLibraryFiles
         var targetColumn = FindColumn(header, "默认目标端口");
         var senderColumn = FindColumn(header, "本机发送端口");
         var receiverColumn = FindColumn(header, "独立接收端口");
+        var sourceColumn = FindColumn(header, "回执源端口");
+        var receiveEncodingColumn = FindColumn(header, "接收编码");
+        var queryEncodingColumn = FindColumn(header, "查询编码");
+        var replyEncodingColumn = FindColumn(header, "查询回执编码");
         var pingColumn = FindColumn(header, "网络Ping");
         var matchColumn = FindColumn(header, "回执匹配");
         var timeoutColumn = FindColumn(header, "查询超时ms");
@@ -157,7 +163,9 @@ internal static class IpLibraryFiles
                     throw new ArgumentException($"第 {row.Line} 行的 UDP 健康模式须填写查询端口、查询指令和预期回执。");
                 var match = row.Get(matchColumn);
                 var timeout = OptionalPort(timeoutColumn) ?? 800;
-                query = new HealthQuery(port, row.Raw(queryColumn), row.Raw(replyColumn), match.Length == 0 ? "exact" : match, timeout);
+                query = new HealthQuery(port, row.Raw(queryColumn), row.Raw(replyColumn), match.Length == 0 ? "exact" : match, timeout,
+                    row.Get(queryEncodingColumn) is { Length: > 0 } queryEncoding ? queryEncoding : "utf8",
+                    row.Get(replyEncodingColumn) is { Length: > 0 } replyEncoding ? replyEncoding : "utf8");
             }
             if (group.Length is 0 or > 80 || label.Length > 80 ||
                 simulation is not ("" or "ok" or "pingFail" or "timeout") ||
@@ -169,8 +177,9 @@ internal static class IpLibraryFiles
                 return new ImportedNode(group, row.Get(idColumn), ip.Length > 0 ? ProjectRules.ParseIp(ip) : null,
                     label.Length == 0 ? null : label, simulation.Length == 0 ? null : simulation,
                     healthMode.Length > 0, query, row.Line,
-                    targetColumn >= 0 || senderColumn >= 0 || receiverColumn >= 0,
-                    new NodeCommunication(OptionalPort(targetColumn), OptionalPort(senderColumn) ?? 0, OptionalPort(receiverColumn)),
+                    targetColumn >= 0 || senderColumn >= 0 || receiverColumn >= 0 || sourceColumn >= 0 || receiveEncodingColumn >= 0,
+                    new NodeCommunication(OptionalPort(targetColumn), OptionalPort(senderColumn) ?? 0, OptionalPort(receiverColumn), OptionalPort(sourceColumn),
+                        row.Get(receiveEncodingColumn) is { Length: > 0 } receiveEncoding ? receiveEncoding : "utf8"),
                     OptionalBool(pingColumn), OptionalBool(customColumn));
             }
             catch (ArgumentException error)

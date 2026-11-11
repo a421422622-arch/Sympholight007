@@ -27,6 +27,8 @@ builder.Services.AddSingleton(_ => new WorkspaceLayout(directory));
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(_ => new ExecutionLogStore(directory));
 builder.Services.AddHostedService(services => services.GetRequiredService<ExecutionLogStore>());
+builder.Services.AddSingleton<UdpTransport>();
+builder.Services.AddHostedService(services => services.GetRequiredService<UdpTransport>());
 builder.Services.AddSingleton<CueEngine>();
 builder.Services.AddSingleton<NodeHealth>();
 builder.Services.AddHostedService<ScheduleWorker>();
@@ -145,7 +147,7 @@ api.MapPut("/project", (Snapshot edit, ProjectStore store) =>
     }
 });
 api.MapGet("/status", (HttpContext context, CueEngine engine, RuntimeOptions settings, ProjectStore store, AccessControl access,
-    NodeHealth health, ExecutionLogStore logs) =>
+    NodeHealth health, ExecutionLogStore logs, UdpTransport transport) =>
 {
     var state = engine.Status();
     var priority = ScheduleCalendar.ActivePriority(store.Get().Project, DateOnly.FromDateTime(DateTime.Now));
@@ -154,6 +156,7 @@ api.MapGet("/status", (HttpContext context, CueEngine engine, RuntimeOptions set
     var logStatus = logs.Status;
     return new { settings.Live, Active = runs.FirstOrDefault(), Runs = runs,
         Events = view.Role is null ? [] : state.Events, ActiveCount = state.Runs.Length,
+        ReceiptVersion = view.Role is null ? 0 : transport.Version,
         Access = view, HealthScan = view.Role is null ? null : health.Progress,
         LogStorageWarning = view.Role is not null && (logStatus.Error is not null || logStatus.LostEntries > 0),
         TimeZone = TimeZoneInfo.Local.Id,

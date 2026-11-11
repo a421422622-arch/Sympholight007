@@ -90,6 +90,34 @@ internal static class UdpNetwork
         }
     }
 
+    public static IPAddress LocalAddressFor(IPAddress remote, int port, Binding? binding)
+    {
+        if (binding is not null)
+            return binding.Addresses.OrderByDescending(address => MatchesPrefix(address, remote) ? address.PrefixLength : -1)
+                .ThenBy(address => address.Address.IsIPv6LinkLocal != remote.IsIPv6LinkLocal).First().Address;
+        using var route = new Socket(remote.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        route.Connect(new IPEndPoint(remote, port));
+        return ((IPEndPoint)route.LocalEndPoint!).Address;
+    }
+
+    public static UdpClient Bind(IPAddress local, int port, Binding? binding)
+    {
+        var client = new UdpClient(local.AddressFamily);
+        try
+        {
+            client.ExclusiveAddressUse = true;
+            if (OperatingSystem.IsWindows() && binding is { Index: > 0 })
+            {
+                var ipv4 = local.AddressFamily == AddressFamily.InterNetwork;
+                client.Client.SetSocketOption(ipv4 ? SocketOptionLevel.IP : SocketOptionLevel.IPv6,
+                    WindowsUnicastInterface, ipv4 ? IPAddress.HostToNetworkOrder(binding.Index) : binding.Index);
+            }
+            client.Client.Bind(new IPEndPoint(local, port));
+            return client;
+        }
+        catch { client.Dispose(); throw; }
+    }
+
     private static LocalAddress[] ReadAddresses(NetworkInterface adapter)
     {
         try
