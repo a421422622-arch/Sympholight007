@@ -75,8 +75,7 @@ internal static class DispatchPlan
 
     public static string DescribePayload(byte[] bytes, string encoding)
     {
-        var hex = "HEX " + Convert.ToHexString(bytes);
-        if (encoding == "hex") return hex;
-        return $"String ({encoding}) {ProjectRules.TextEncoding(encoding).GetString(bytes)} · {hex}";
+        if (encoding == "hex") return "HEX " + BitConverter.ToString(bytes).Replace('-', ' ');
+        return $"String ({encoding}) {ProjectRules.TextEncoding(encoding).GetString(bytes)}";
     }
 }
