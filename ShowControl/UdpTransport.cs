@@ -23,7 +23,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
 
     public async Task<bool> Exchange(IPAddress address, int port, byte[] bytes, string encoding, NodeCommunication? communication,
         string? adapter, int adapterWaitSeconds, ReplyPolicy response, UdpContext context, Action<string, string> step,
-        Func<CancellationToken, Task<bool>>? afterSend, CancellationToken token)
+        CancellationToken token)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, closing.Token);
         token = linked.Token;
@@ -89,7 +89,6 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
                 (response.Mode == "none" ? " · 不等待回执" : ""));
             using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
             if (pending is not null) wait.CancelAfter(response.TimeoutMs);
-            if (afterSend is not null && !await afterSend(wait.Token)) return false;
             if (pending is null) { confirmed = true; return true; }
             step("wait", $"等待 {response.Mode} 回执 {response.Text} · {response.TimeoutMs} ms");
             await pending.Completion.Task.WaitAsync(wait.Token);
@@ -238,7 +237,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
         var project = store.Get().Project;
         var router = new UdpNetwork.Router(project);
         var desired = new HashSet<IPEndPoint>();
-        foreach (var node in project.NodeLibrary ?? [])
+        foreach (var node in project.IpGroups.SelectMany(group => group.Nodes).DistinctBy(node => node.Ip))
         {
             var communication = node.Communication;
             if (communication is null || (communication.SenderPort == 0 && communication.ReceiverPort is null)) continue;

@@ -14,15 +14,15 @@ const packetEncodings = [...stringEncodings.map(([id, name]) => [id, "String · 
 const defaultLayout = { order: ["project", "workspace", "properties", "log"], sizes: {} };
 const adminActions = new Set(["rename-project", "edit-show", "add-group", "edit-group", "add-list", "edit-list",
   "add-cue", "add-target", "remove-target", "delete-cue", "up", "down", "edit-resource", "delete-resource",
-  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "cue-node-override", "project-export", "project-import", "project-restore"]);
-const scheduleModes = { weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
+  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "delete-node", "reset-target-inheritance", "cue-node-override", "project-export", "project-import", "project-restore"]);
+const scheduleModes = { grouped: "各播放组独立判断", weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
 const weekdays = [[1, "一"], [2, "二"], [3, "三"], [4, "四"], [5, "五"], [6, "六"], [0, "日"]];
-const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务", health: "软件检测", udp: "UDP 回传" };
+const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务", health: "软件检测", sceneStop: "现场停止", udp: "UDP 回传" };
 const playbackModes = { once: "顺序播放一次", loop: "循环播放" };
 const playbackSecondsInput = { type: "number", min: 0, max: 3600, step: 0.001 };
 const eventLabels = {
   queued: "已接收", send: "发送 UDP", ping: "Ping 检查", wait: "等待回执", ack: "已确认",
-  success: "成功", failed: "失败", retry: "重试", skipped: "跳过", stopped: "停止",
+  success: "发送处理完成", networkWarning: "网络检测异常", retryBlocked: "重试已禁用", failed: "失败", retry: "重试", skipped: "跳过", stopped: "停止",
   priority: "优先调度", interval: "播放间隔", adapterWait: "等待网卡", adapterReady: "网卡恢复",
   completed: "完成", completedWithSkips: "完成 · 有跳过", receive: "收到数据", deviceWait: "节点排队"
 };
@@ -56,7 +56,7 @@ async function request(url, method = "GET", data) {
   }
   const response = await fetch("/api" + url, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || body.detail || `请求失败 (${response.status})`);
+  if (!response.ok) throw Object.assign(new Error(body.message || body.detail || `请求失败 (${response.status})`), { status: response.status });
   return body;
 }
 
@@ -83,14 +83,20 @@ function responseFor(cue, target) {
 }
 
 function linkNodes(preferGroups = false) {
-  const nodes = new Map((preferGroups ? [] : state.project.nodeLibrary ?? []).map(node => [node.ip, node]));
+  const nodes = new Map((state.project.nodeLibrary ?? []).map(node => [node.ip, node]));
+  if (preferGroups) {
+    const incoming = new Map();
+    for (const group of state.project.ipGroups)
+      for (const node of group.nodes)
+        if (!incoming.has(node.ip)) incoming.set(node.ip, node);
+    for (const [ip, node] of incoming) nodes.set(ip, node);
+  }
   for (const group of state.project.ipGroups)
     group.nodes = group.nodes.map(node => {
       if (!nodes.has(node.ip)) nodes.set(node.ip, node);
       return nodes.get(node.ip);
     });
-  const used = new Set(state.project.ipGroups.flatMap(group => group.nodes.map(node => node.ip)));
-  state.project.nodeLibrary = [...nodes.values()].filter(node => used.has(node.ip));
+  state.project.nodeLibrary = [...nodes.values()];
 }
 
 function replyFields(policy = { mode: "none" }, prefix = "") {
@@ -129,6 +135,7 @@ function dirty() {
   state.editCounter++;
   state.dirty = true;
   updateSave();
+  queueEffectiveSettings();
 }
 
 function updateSave() {
@@ -200,7 +207,7 @@ function renderTree() {
         <summary><span>${esc(group.name)}</span>${manage("edit-group", group.id, "管理分组")}</summary>
         ${group.lists.map(list => `<div class="list-row"><button type="button" data-action="select-list" data-id="${esc(list.id)}" class="list${list.id === state.listId ? " selected" : ""}">▤ ${esc(list.name)}</button>
           <button class="icon tree-transport" type="button" data-action="tree-play" data-id="${esc(list.id)}" data-empty="${!list.cues.length}" aria-label="播放 ${esc(list.name)}" title="播放" ${!list.cues.length ? "disabled" : ""}>▶</button>
-          <button class="icon tree-transport danger" type="button" data-action="stop-selected" data-id="${esc(list.id)}" aria-label="停止 ${esc(list.name)}" title="停止" disabled>■</button></div>
+          <button class="icon tree-transport danger" type="button" data-action="stop-selected" data-id="${esc(list.id)}" aria-label="停止调度 ${esc(list.name)}" title="停止平台调度" disabled>■</button></div>
           ${list.cues.filter(cue => list.id === state.listId || (query && cue.name.toLowerCase().includes(query)))
             .map(cue => `<button type="button" class="cue-link${cue.id === state.cueId ? " selected" : ""}" data-action="select-cue"
               data-id="${esc(cue.id)}" data-list-id="${esc(list.id)}">· ${esc(cue.name)}</button>`).join("")}`).join("")}
@@ -227,6 +234,7 @@ function render() {
   applyLayout();
   updateTransport();
   updateSave();
+  queueEffectiveSettings();
 }
 
 function applyLayout(layout = state.layout) {
@@ -435,7 +443,8 @@ function renderCues() {
   const mode = list.playbackMode ?? "once";
   const transport = `<div class="playback-bar">
     <div class="transport" role="group" aria-label="播放控制">${button("▶ 播放", "run", list.id, "strong", !list.cues.length)}
-      ${button("■ 停止", "stop-selected", list.id, "danger", true)}</div>
+      ${button("■ 停止调度", "stop-selected", list.id, "danger", true)}
+      ${button("停止现场", "stop-scene", list.id, "danger", !list.stopListId)}</div>
     <span class="playback-mode">播放组 ${esc(list.playbackGroup ?? "默认")} · ${esc(playbackModes[mode])} · 默认间隔 ${esc(waitLabel(list.intervalMs ?? 0))}</span>
     <span id="playbackStatus" class="playback-status" role="status"></span>
     <div id="triggerCountdown" class="trigger-countdown" hidden>
@@ -504,7 +513,7 @@ function updateTransport() {
   const stopSelected = $("main").querySelector('[data-action="stop-selected"]');
   if (stopSelected) {
     stopSelected.disabled = !active || stopping;
-    stopSelected.textContent = stopping ? "正在停止…" : "■ 停止";
+    stopSelected.textContent = stopping ? "正在停止…" : "■ 停止调度";
     $("main").querySelector('[data-action="run"]').disabled =
       !selected()?.list.cues.length || state.stoppingAll || (!!active && (active.source !== "schedule" || stopping));
     const playbackStatus = $("playbackStatus");
@@ -520,7 +529,7 @@ function updateTransport() {
     });
   }
   $("stop").disabled = state.stoppingAll || !state.runs.some(run => !run.stopping);
-  $("stop").textContent = state.stoppingAll ? "正在停止…" : "■ 全部停止";
+  $("stop").textContent = state.stoppingAll ? "正在停止…" : "■ 停止全部调度";
   $("active").classList.toggle("running", state.runs.length > 0);
   $("active").textContent = state.runs.length ? `${state.runs.length} 个列表运行中` : "引擎待命";
   $("active").title = state.runs.map(run => `${run.playbackGroup ?? "默认"} · ${run.list}`).join("\n");
@@ -577,12 +586,15 @@ function renderProperties() {
         field("数据类型", "dataType", command.encoding === "hex" ? "hex" : "string", { choices: [["string", "String 文本"], ["hex", "HEX 原始字节"]] }) +
         (command.encoding === "hex" ? "" : field("String 文本编码", "encoding", command.encoding, { choices: stringEncodings }))) +
       field("目标端口（留空继承）", "port", command.port ?? "", { type: "number", min: 1, max: 65535, placeholder: "模板 → 节点默认" }) +
+      field("允许自动重试", "allowRetry", command.allowRetry == null ? "" : String(command.allowRetry),
+        { wide: true, choices: [["", "沿用模板（无模板时禁用）"], ["true", "允许重复执行"], ["false", "禁止自动重试"]] }) +
       field("回执模式", "responseMode", response.mode, { choices: [["inherit", "沿用命令模板"], ...Object.entries(replyModes)] }) +
       (!["none", "inherit"].includes(response.mode) ? field("预期 UDP 回执", "responseText", response.text, { wide: true }) +
         (response.mode === "hex" ? "" : field("String 回执编码", "responseEncoding", response.encoding ?? "utf8", { choices: stringEncodings })) +
         field("回执超时 (ms)", "responseTimeout", response.timeoutMs, { type: "number", min: 100, max: 30000 }) : "") +
       `</div><p class="property-help">${command.nodeOverrides?.length ?? 0} 个节点例外</p>` +
-      button("逐 IP 例外", "cue-node-override", index, "quiet") + "</section>";
+      button("逐 IP 例外", "cue-node-override", index, "quiet") +
+      button("恢复目标组继承", "reset-target-inheritance", index, "quiet") + "</section>";
   }).join("");
   const canAdd = choices.some(group => group.nodes.length && !commands.some(command => command.ipGroupId === group.id));
   $("properties").innerHTML = top + '<div id="cueForm"><div class="property-form">' +
@@ -592,11 +604,13 @@ function renderProperties() {
     }) +
     "</div>" + cards + button("＋ 添加目标组", "add-target", "", "quiet", !canAdd) +
     '<h3 class="cue-checks">Cue 的设备检测和失败策略</h3><div class="property-form">' +
-    field("发送后检查 ICMP Ping", "ping", cue.ping, { type: "checkbox", wide: true }) +
+    field("附加 ICMP Ping 检测（独立记录）", "ping", cue.ping, { type: "checkbox", wide: true }) +
     field("失败策略", "onFail", cue.onFail, { choices: Object.entries(policies) }) +
     (cue.onFail === "retry" ? field("重试次数", "retries", cue.retries, { type: "number", min: 0, max: 5 }) : "") +
-    '</div></div><p class="property-help">各目标组的指令可单独设置回执。ICMP Ping 检查设备可达性。重试仅重发失败节点。</p><div class="actions">' +
-    button("执行预览", "dispatch-preview", cue.id, "strong") + button("移除 Cue", "delete-cue", cue.id, "quiet") + "</div>";
+    '</div></div><p class="property-help">各目标组的指令可单独设置回执。ICMP Ping 检查设备可达性。重试仅用于已明确允许重复执行的未确认命令。</p><div class="actions">' +
+    button("执行预览", "dispatch-preview", cue.id, "strong") + button("移除 Cue", "delete-cue", cue.id, "quiet") + "</div>" +
+    '<div id="effectiveSettings" class="property-help">正在解析生效设置…</div>';
+  queueEffectiveSettings();
   if (state.access.role !== "admin")
     $("properties").querySelectorAll("input, select, textarea").forEach(input => { input.disabled = true; });
 }
@@ -604,8 +618,8 @@ function renderProperties() {
 const resourceInfo = {
   ips: ["IP 分组库", "支持 Excel 和 TXT 批量合并。导出的文件可作模板，TXT 也可每行填写一个 IP。", "新增 IP 分组"],
   templates: ["模板库", "维护可在任意 Cue 中引用的 UDP 内容和编码。", "新增模板"],
-  schedules: ["定时任务", "指定日 > 节假日 > 周循环。当天只允许最高优先级的定时任务，手动和 Action Pad 仍可执行。", "新增任务"],
-  pads: ["Action Pad", "点击一个按钮以手动优先级运行指定 Cue 列表。", "新增按钮"]
+  schedules: ["定时任务", "指定日 > 节假日 > 周循环。同一播放组当天采用最高优先级的定时任务，手动和 Action Pad 仍可执行。", "新增任务"],
+  pads: ["Action Pad", "运行 Cue 列表，或按按钮配置停止调度和现场节目。", "新增按钮"]
 };
 const collections = { ips: "ipGroups", templates: "templates", schedules: "schedules", pads: "pads" };
 
@@ -624,7 +638,7 @@ function scheduleDays(item) {
 function updateScheduleMode() {
   const indicator = $("scheduleMode");
   if (indicator)
-    indicator.textContent = `今日定时 · ${scheduleModes[state.scheduleMode]}${state.timezone ? " · " + state.timezone : ""}`;
+    indicator.textContent = `今日定时 · ${scheduleModes.grouped}${state.timezone ? " · " + state.timezone : ""}`;
   const recent = $("scheduleResults");
   if (!recent) return;
   const labels = { accepted: "已触发", skipped: "已跳过", missed: "已错过", pending: "结果待确认" };
@@ -646,15 +660,15 @@ function renderResource() {
   let content;
   if (kind === "pads") {
     content = '<div class="pads">' + entries.map(item => `<article class="pad">
-      <button type="button" class="fire${item.action === "stopAll" ? " stop-pad" : ""}" data-action="fire-pad" data-id="${esc(item.id)}">${item.action === "stopAll" ? "■" : "▶"} ${esc(item.name)}</button>
-      <p>${item.action === "stopAll" ? "全部停止" : esc(listLabel(item.listId))}</p><div class="actions">${edit(item)}</div></article>`).join("") +
+      <button type="button" class="fire${item.action === "stopAll" || item.action === "stopScene" ? " stop-pad" : ""}" data-action="fire-pad" data-id="${esc(item.id)}">${item.action === "stopAll" || item.action === "stopScene" ? "■" : "▶"} ${esc(item.name)}</button>
+      <p>${item.action === "stopAll" ? "停止全部调度" : (item.action === "stopScene" ? "停止现场 · " : "") + esc(listLabel(item.listId))}</p>${item.action === "play" && item.stopAction ? `<button type="button" class="fire stop-pad" data-action="pad-stop" data-id="${esc(item.id)}">■ ${item.stopAction === "scene" ? "停止现场" : "停止调度"}</button>` : ""}<div class="actions">${edit(item)}</div></article>`).join("") +
       (entries.length ? "" : '<p class="empty">还没有 Action Pad 按钮。</p>') + "</div>";
   } else if (kind === "ips") {
     content = table(["分组", "节点数", "地址", "操作"], entries.map(item =>
       `<tr><td>${esc(item.name)}</td><td>${item.nodes.length}</td><td class="mono">${esc(item.nodes.slice(0, 4).map(node => node.ip).join(" · "))}${item.nodes.length > 4 ? " …" : ""}</td><td><div class="actions">${edit(item)}${button("健康查询", "edit-ip-health", item.id, "quiet", !item.nodes.length)}</div></td></tr>`).join("")) +
       '<div class="node-library-head"><h2>统一节点设置</h2>' + button("批量设置", "node-batch", "", "quiet") + '</div><p class="property-help">同一 IP 在各分组共用通信与健康设置。单独设置的节点默认受批量保护。</p>' +
       table(["IP / 名称", "所属组", "默认目标端口", "收发端口", "设置", "操作"], (state.project.nodeLibrary ?? []).map(node =>
-        `<tr><td class="mono">${esc(node.ip)}<br>${esc(node.label)}</td><td>${esc(state.project.ipGroups.filter(group => group.nodes.some(item => item.ip === node.ip)).map(group => group.name).join(" / "))}</td><td>${node.communication?.targetPort ?? "待配置"}</td><td>发送 ${node.communication?.senderPort || "自动"}<br>接收 ${node.communication?.receiverPort ?? "跟随发送"}</td><td>${node.customized ? "单独设置" : "共用设置"}</td><td>${button("通信与健康", "node-settings", node.ip, "quiet")}</td></tr>`).join(""));
+        `<tr><td class="mono">${esc(node.ip)}<br>${esc(node.label)}</td><td>${esc(state.project.ipGroups.filter(group => group.nodes.some(item => item.ip === node.ip)).map(group => group.name).join(" / "))}</td><td>${node.communication?.targetPort ?? "待配置"}</td><td>发送 ${node.communication?.senderPort || "自动"}<br>接收 ${node.communication?.receiverPort ?? "跟随发送"}</td><td>${node.customized ? "单独设置" : "共用设置"}</td><td>${button("通信与健康", "node-settings", node.ip, "quiet")}${state.project.ipGroups.some(group => group.nodes.some(member => member.ip === node.ip)) ? "" : button("删除未分组节点", "delete-node", node.ip, "quiet")}</td></tr>`).join(""));
   } else if (kind === "templates") {
     content = table(["模板", "编码", "指令内容", "操作"], entries.map(item =>
       `<tr><td>${esc(item.name)}</td><td>${badge(item.encoding.toUpperCase())}</td><td class="mono">${esc(item.payload.slice(0, 100))}</td><td><div class="actions">${edit(item)}</div></td></tr>`).join(""));
@@ -663,7 +677,7 @@ function renderResource() {
       table(["任务", "模式", "日期规则", "时间", "Cue 列表", "状态", "操作"], entries.map(item =>
         `<tr><td>${esc(item.name)}</td><td>${badge(scheduleModes[item.mode ?? "weekly"])}</td><td>${esc(scheduleDays(item))}</td>
         <td class="mono">${esc(item.at)}</td><td>${esc(listLabel(item.listId))}</td><td>${badge(item.enabled ? "已启用" : "已停用", item.enabled ? "good" : "")}</td><td><div class="actions">${edit(item)}</div></td></tr>`).join("")) +
-      '<details class="schedule-history"><summary>最近定时记录</summary><div id="scheduleResults"></div></details>';
+      '<details class="schedule-history"' + (state.scheduleStatus?.needsRecovery ? " open" : "") + '><summary>最近定时记录</summary><div id="scheduleResults"></div></details>';
   }
   const fileActions = kind === "ips" ? button("导入 Excel / TXT", "import-ips", "", "quiet", state.importingIps) +
     button("导出 Excel", "export-ips", "xlsx", "quiet") + button("导出 TXT", "export-ips", "txt", "quiet") : "";
@@ -791,7 +805,7 @@ async function importProjectConfiguration(file) {
   catch { throw new Error("请选择有效的工程配置 JSON。"); }
   const project = await request("/project/configuration", "POST", configuration);
   if (state.access.role !== "admin") return;
-  if (state.dirty && !confirm("导入会替换当前未保存的草稿。继续吗？")) return;
+  if (state.dirty && !await confirmDialog("导入会替换当前未保存的草稿。继续吗？")) return;
   state.project = project;
   linkNodes();
   state.health = [];
@@ -802,7 +816,7 @@ async function importProjectConfiguration(file) {
 }
 
 async function restoreProject(id) {
-  if (!confirm("将所选历史版本恢复为已保存工程，并替换当前草稿。继续吗？")) return;
+  if (!await confirmDialog("将所选历史版本恢复为已保存工程，并替换当前草稿。继续吗？")) return;
   await request("/project/restore", "PUT", { id, revision: state.revision });
   $("editor").close();
   await load();
@@ -827,6 +841,7 @@ async function importIpLibrary(file) {
   const form = new FormData();
   form.set("file", file);
   form.set("groups", original);
+  form.set("library", JSON.stringify(project.nodeLibrary ?? []));
   try {
     const groups = await request("/ip-library/import", "POST", form);
     if ($("editor").open || state.project !== project || JSON.stringify(project.ipGroups) !== original)
@@ -881,10 +896,12 @@ function requiredName(data) {
   return name;
 }
 
-function removeHierarchy(collection, item, listIds) {
+async function removeHierarchy(collection, item, listIds) {
+  if (lists().some(row => !listIds.includes(row.list.id) && listIds.includes(row.list.stopListId)))
+    throw new Error("请先解除引用该列表的现场停止流程绑定。");
   if ([...state.project.schedules, ...state.project.pads].some(ref => listIds.includes(ref.listId)))
     throw new Error("请先移除引用该 Cue 列表的定时任务和 Action Pad 按钮。");
-  if (confirm(`移除「${item.name}」及其下属条目？`))
+  if (await confirmDialog(`移除「${item.name}」及其下属条目？`))
     collection.splice(collection.indexOf(item), 1);
   else return false;
   return true;
@@ -915,16 +932,17 @@ function editResource(id) {
       '<div id="templateTextEncoding"' + (item?.encoding === "hex" ? ' hidden' : '') + '>' +
       field("String 文本编码", "encoding", item?.encoding === "hex" ? "utf8" : item?.encoding ?? "utf8", { choices: stringEncodings }) + '</div>' +
       field("UDP 指令", "payload", item?.payload, { type: "textarea", required: true }) +
+      field("允许自动重试（指令可重复执行）", "templateAllowRetry", item?.allowRetry ?? false, { type: "checkbox" }) +
       field("目标端口（留空沿用节点）", "templatePort", item?.port ?? "", { type: "number", min: 1, max: 65535 }) +
       replyFields(item?.response ?? { mode: "none" }, "templateReply-");
   } else {
     if (kind === "pads")
-      fields += field("按钮动作", "padAction", item?.action ?? "play", { choices: [["play", "播放 Cue 列表"], ["stopAll", "全部停止"]] });
+      fields += field("按钮动作", "padAction", item?.action ?? "play", { choices: [["play", "播放 Cue 列表"], ["stopScene", "停止现场节目"], ["stopAll", "停止全部调度"]] }) + field("附带停止按钮（仅播放动作）", "padStop", item?.stopAction ?? "", { choices: [["", "不显示"], ["run", "停止平台调度"], ["scene", "停止现场流程"]] });
     fields += `<div id="targetListField"${item?.action === "stopAll" ? " hidden" : ""}>` +
       field("目标 Cue 列表", "listId", item?.listId, { choices: lists().map(row => [row.list.id, listLabel(row.list.id)]) }) + "</div>";
     if (kind === "schedules") {
       const mode = item?.mode ?? "weekly";
-      fields += field("定时模式", "mode", mode, { choices: Object.entries(scheduleModes) }) +
+      fields += field("定时模式", "mode", mode, { choices: Object.entries(scheduleModes).filter(([mode]) => mode !== "grouped") }) +
         field("执行时间", "at", item?.at ?? "19:00", { type: "time", required: true }) +
         '<div id="scheduleFields" class="property-form wide">' + scheduleFields(mode, item) + "</div>" +
         field("补播窗口 (分钟，0 为跳过)", "catchUpMinutes", item?.catchUpMinutes ?? 0, { type: "number", min: 0, max: 60, required: true }) +
@@ -945,10 +963,12 @@ function editResource(id) {
       Object.assign(next, { payload: data.get("payload"), encoding: data.get("dataType") === "hex" ? "hex" : data.get("encoding") });
       next.port = readPort(data, "templatePort");
       next.response = readReply(data, "templateReply-");
+      next.allowRetry = data.has("templateAllowRetry");
     } else {
       next.listId = data.get("listId");
       if (kind === "pads") {
         next.action = data.get("padAction");
+        next.stopAction = next.action === "play" ? (data.get("padStop") || null) : null;
         if (next.action === "stopAll") next.listId = "";
       }
       if (next.action !== "stopAll" && !next.listId) throw new Error("请选择目标 Cue 列表。");
@@ -991,12 +1011,103 @@ function editResource(id) {
   }
 }
 
+let effectiveTimer;
+let effectiveRequest = 0;
+
+function queueEffectiveSettings() {
+  clearTimeout(effectiveTimer);
+  const ticket = ++effectiveRequest;
+  const element = $("effectiveSettings");
+  if (!element) return;
+  element.textContent = "正在解析生效设置…";
+  effectiveTimer = setTimeout(async () => {
+    const cue = selectedCue();
+    if (!cue) return;
+    try {
+      const rows = await request("/dispatch-preview", "POST", { project: state.project, cueId: cue.id });
+      if (ticket !== effectiveRequest || !$("effectiveSettings")) return;
+      const summaries = [...new Set(rows.map(row =>
+        `${row.port}（${row.portSource}） · ${replyModes[row.response.mode]}（${row.responseSource}） · 自动重试${row.allowRetry ? "允许" : "禁用"}`))];
+      $("effectiveSettings").innerHTML = "<b>当前生效设置 · " + rows.length + " 条发送</b><br>" +
+        summaries.map(esc).join("<br>");
+    } catch (error) {
+      if (ticket === effectiveRequest && $("effectiveSettings"))
+        $("effectiveSettings").textContent = "待完善配置 · " + error.message;
+    }
+  }, 250);
+}
+
+function listIps(list) {
+  const ips = new Set();
+  for (const cue of list.cues)
+    for (const target of targets(cue))
+      for (const node of state.project.ipGroups.find(group => group.id === target.ipGroupId)?.nodes ?? [])
+        ips.add(node.ip);
+  return ips;
+}
+
+async function sharedRunNote(owner, stop) {
+  try {
+    const overlaps = await request("/stop-scope/" + encodeURIComponent(owner.id));
+    if (!overlaps.length) return "";
+    const lines = overlaps.map(item => `${item.playbackGroup ?? "默认"} · ${item.list}（共用 ${item.sharedIps.join("、")}${item.declared ? "，分区重叠" : "，未声明分区，按共用节点推断"}）`);
+    return `\n注意：以下播放组正在运行，且可能受停止命令影响：\n${lines.join("\n")}\n它们不会被自动停止，请确认停止命令不会影响这些分区。`;
+  } catch { return sharedRunNoteLocal(owner, stop); }
+}
+
+function sharedRunNoteLocal(owner, stop) {
+  const stopIps = listIps(stop);
+  const names = state.runs
+    .filter(run => run.playbackGroup !== owner.playbackGroup && run.listId !== owner.id)
+    .filter(run => {
+      const other = lists().find(row => row.list.id === run.listId)?.list;
+      return other && [...listIps(other)].some(ip => stopIps.has(ip));
+    })
+    .map(run => `${run.playbackGroup ?? "默认"} · ${run.list}`);
+  return names.length
+    ? `\n注意：以下播放组正在运行且与停止命令共用节点：${names.join("、")}\n它们不会被自动停止，请确认停止命令不会影响这些分区。`
+    : "";
+}
+
+async function stopScene(id, endpoint = "/stop-scene/" + id) {
+  if (state.dirty) throw new Error("请先保存工程，再执行现场停止。");
+  const owner = lists().find(row => row.list.id === id)?.list;
+  const stop = lists().find(row => row.list.id === owner?.stopListId)?.list;
+  if (!stop) throw new Error("请在列表设置中绑定现场停止流程。");
+  const revision = state.revision;
+  const latest = await request("/project");
+  if (state.dirty) throw new Error("请先保存工程，再执行现场停止。");
+  if (latest.revision !== revision || state.revision !== revision) {
+    await load();
+    throw new Error("工程已在其他窗口更新，页面已刷新。请核对停止目标后重新确认。");
+  }
+  const groups = [...new Set(stop.cues.flatMap(cue => targets(cue).map(target =>
+    state.project.ipGroups.find(group => group.id === target.ipGroupId)?.name ?? target.ipGroupId)))];
+  if (await confirmDialog(`执行「${owner.name}」的现场停止流程「${stop.name}」？
+命令目标组：${groups.join("、")}${await sharedRunNote(owner, stop)}
+请确认 LAS 停止命令的实际影响范围。`))
+    await run(endpoint, revision);
+}
+
 function editIpHealth(id) {
   const group = state.project.ipGroups.find(item => item.id === id);
   if (group?.nodes.length) editNodeSettings(null, group);
 }
 
-function deleteResource(id) {
+function confirmDialog(message) {
+  if (document.querySelector(".operation-confirm[open]")) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "operation-confirm";
+    dialog.innerHTML = '<form method="dialog"><header><h2>请确认</h2></header><p class="confirm-text" style="padding:14px 17px;margin:0;white-space:pre-wrap"></p><footer><button value="cancel" class="button quiet">取消</button><button value="ok" class="button strong">确定</button></footer></form>';
+    dialog.querySelector(".confirm-text").textContent = message;
+    dialog.addEventListener("close", () => { resolve(dialog.returnValue === "ok"); dialog.remove(); });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+async function deleteResource(id) {
   const kind = state.tab;
   const entries = state.project[collections[kind]];
   const item = entries.find(entry => entry.id === id);
@@ -1005,7 +1116,7 @@ function deleteResource(id) {
       lists().some(row => row.list.cues.some(cue => targets(cue).some(target =>
         target[key] === id || (kind === "templates" && target.nodeOverrides?.some(custom => custom.templateId === id))))))
     throw new Error("该资源仍被 Cue 引用。");
-  if (confirm(`移除「${item.name}」？`)) {
+  if (await confirmDialog(`移除「${item.name}」？`)) {
     entries.splice(entries.indexOf(item), 1);
     dirty();
     render();
@@ -1018,7 +1129,8 @@ function editNodeSettings(ip, group = null) {
   const query = defaults.healthQuery;
   const setting = (key, label, value, options = {}) =>
     field("修改此项", "apply-" + key, !!single, { type: "checkbox" }) + field(label, key, value, options);
-  const fields = (single ? `<p class="property-help">${esc(single.ip)}，设置同步到所有所属组。</p>` + field("节点名称", "nodeLabel", single.label) :
+  const fields = (single ? `<p class="property-help">${esc(single.ip)}，设置同步到所有所属组。</p>` + field("节点名称", "nodeLabel", single.label) +
+    field("保护此节点免受批量修改", "protectNode", true, { type: "checkbox" }) :
     field("IP 范围或地址（每行一个，留空为全部节点）", "scope", group?.nodes.map(node => node.ip).join("\n") ?? "", { type: "textarea", placeholder: "192.168.1.10-192.168.1.30" }) +
     field("覆盖已单独设置的节点", "overwriteCustom", false, { type: "checkbox" })) +
     setting("targetPort", "默认目标端口（留空表示未设置）", defaults.communication?.targetPort ?? "", { type: "number", min: 1, max: 65535 }) +
@@ -1067,7 +1179,7 @@ function editNodeSettings(ip, group = null) {
       if (Object.keys(communication).length) node.communication = { ...node.communication, ...communication };
       if (keys.includes("pingEnabled")) node.pingEnabled = data.has("pingEnabled");
       if (keys.includes("health")) node.healthQuery = healthQuery;
-      node.customized = !!single;
+      if (single) node.customized = data.has("protectNode");
     }
   });
   const preview = () => {
@@ -1136,16 +1248,33 @@ async function showDispatchPreview(id) {
   const rows = await request("/dispatch-preview", "POST", { project: state.project, cueId: id });
   edit("Cue 执行预览", '<p class="property-help">按当前草稿解析。来源优先级为 Cue 节点例外 → Cue 目标组 → 模板 → 节点默认值。此操作不发送数据。</p>' +
     table(["目标组 / IP", "发送内容 / 来源", "目标端口 / 来源", "本机发送 / 接收", "预期回执 / 来源"], rows.map(row =>
-      `<tr><td>${esc(row.group)}<br><code>${esc(row.node.ip)}</code></td><td><pre>${esc(row.payload)}</pre>${esc(row.encoding === "hex" ? "HEX" : "String · " + row.encoding)} · ${esc(row.commandSource)}</td><td>${row.port}<br>${esc(row.portSource)}</td><td>${row.senderPort || "自动"} / ${row.receiverPort ?? "跟随发送"}${row.requiresListener ? '<br><span class="badge">统一监听</span>' : ""}</td><td>${esc(replyModes[row.response.mode])}<pre>${esc(row.response.text ?? "")}</pre>${row.response.mode === "none" ? "" : row.response.timeoutMs + " ms · "}${esc(row.responseSource)}</td></tr>`).join("")), () => {}, null, false);
+      `<tr><td>${esc(row.group)}<br><code>${esc(row.node.ip)}</code></td><td><pre>${esc(row.payload)}</pre>${esc(row.encoding === "hex" ? "HEX" : "String · " + row.encoding)} · ${esc(row.commandSource)}</td><td>${row.port}<br>${esc(row.portSource)}</td><td>${row.senderPort || "自动"} / ${row.receiverPort ?? "跟随发送"}${row.requiresListener ? '<br><span class="badge">统一监听</span>' : ""}</td><td>${esc(replyModes[row.response.mode])}<pre>${esc(row.response.text ?? "")}</pre>${row.response.mode === "none" ? "" : row.response.timeoutMs + " ms · "}${esc(row.responseSource)}<br>自动重试${row.allowRetry ? "允许" : "禁用"}</td></tr>`).join("")), () => {}, null, false);
   $("editor").classList.add("wide-editor");
   $("editForm").querySelector('[type="submit"]').textContent = "关闭";
   $("cancelEdit").hidden = true;
 }
 
-async function run(path) {
+const pendingRuns = new Set();
+
+async function run(path, revision = state.revision) {
+  if (pendingRuns.has(path)) return;
+  pendingRuns.add(path);
+  try { await runChecked(path, revision); }
+  finally { pendingRuns.delete(path); }
+}
+
+async function runChecked(path, revision) {
   if (state.stoppingAll) throw new Error("正在停止全部播放。");
   if (state.dirty) throw new Error("先保存项目，再执行当前配置。");
-  const result = await request(path, "POST");
+  if (revision !== state.revision) throw new Error("工程已更新，请重新核对并确认执行。");
+  let result;
+  try { result = await request(path + (path.includes("?") ? "&" : "?") + "revision=" + revision, "POST"); }
+  catch (error) {
+    if (error.status !== 412) throw error;
+    if (state.dirty) throw new Error("工程已在其他窗口更新，当前草稿仍保留。请核对后再执行。");
+    await load();
+    throw new Error("工程已在其他窗口更新，页面已刷新。请核对后重新确认执行。");
+  }
   notice(result.message);
   await poll();
 }
@@ -1156,7 +1285,7 @@ async function stopRun(active) {
   updateTransport();
   try {
     const result = await request("/stop/" + active.id, "POST");
-    notice(result.stopped ? "已请求停止本次执行。" : "本次执行已经结束。");
+    notice(result.stopped ? "已请求停止本次平台调度。" : "本次调度已经结束。");
     await poll();
   } finally {
     state.stoppingRuns.delete(active.id);
@@ -1222,6 +1351,13 @@ async function act(action, id, target) {
       field("播放组", "playbackGroup", list.playbackGroup ?? "默认", { required: true, suggestions: "playbackGroups" }) +
       `<datalist id="playbackGroups">${knownGroups.map(groupName => option(groupName, groupName)).join("")}</datalist>` +
       '<p class="property-help">同组触发新列表会切换播放，不同组可以同时播放。</p>' +
+      field("现场停止流程", "stopListId", list.stopListId ?? "", {
+        choices: [["", "未配置"], ...lists().filter(row => row.list.id !== list.id && row.list.cues.length)
+          .map(row => [row.list.id, listLabel(row.list.id)])]
+      }) +
+      '<p class="property-help">选择包含实际 LAS 停止命令的列表。点击停止现场时，以本播放组执行一次该流程。请核对命令影响范围。</p>' +
+      field("控制分区（逗号分隔，* 表示整节点，留空为未声明）", "controlZones", (list.controlZones ?? []).join(",")) +
+      '<p class="property-help">按 LAS 工程里的实际分区填写。声明后，现场停止的影响提示按分区判断；未声明时按共用节点推断，只提示不拦截。</p>' +
       field("播放模式", "playbackMode", list.playbackMode ?? "once", { choices: Object.entries(playbackModes) }) +
       field("默认间隔 (s)", "intervalSeconds", (list.intervalMs ?? 0) / 1000, {
         ...playbackSecondsInput, required: true
@@ -1236,15 +1372,21 @@ async function act(action, id, target) {
         if (playbackMode === "loop" && list.cues.length &&
             list.cues.reduce((total, cue) => total + (cue.delayAfterMs ?? intervalMs), 0) < 100)
           throw new Error("循环播放每轮至少需要 0.1 秒的等待时间。");
-        Object.assign(list, { name, playbackGroup, playbackMode, intervalMs });
+        const zones = [...new Map(data.get("controlZones").split(/[,，]/).map(zone => zone.trim()).filter(Boolean).map(zone => [zone.toLowerCase(), zone])).values()];
+        if (zones.length > 20 || zones.some(zone => zone.length > 40) || (zones.includes("*") && zones.length > 1))
+          throw new Error("控制分区最多 20 个、每个不超过 40 个字符，整节点「*」不能与其他分区并用。");
+        Object.assign(list, { name, playbackGroup, playbackMode, intervalMs, stopListId: data.get("stopListId") || null, controlZones: zones.length ? zones : null });
+        const mine = listIps(list);
+        const clash = lists().filter(row => row.list.id !== list.id && row.list.playbackGroup !== list.playbackGroup && [...listIps(row.list)].some(ip => mine.has(ip)) && (!zones.length || !row.list.controlZones?.length || zones.includes("*") || row.list.controlZones.includes("*") || zones.some(zone => row.list.controlZones.some(other => other.toLowerCase() === zone.toLowerCase())))).map(row => row.list.name);
+        if (clash.length) notice(`提示：本列表与其他播放组共用节点${zones.length ? "且分区重叠" : "（未声明分区）"}：${clash.slice(0, 5).join("、")}${clash.length > 5 ? " 等" : ""}。现场停止不会自动停止它们。`);
       },
       () => removeHierarchy(group.lists, list, [list.id]));
   } else if (action === "add-cue") {
     const group = project.ipGroups.find(item => item.nodes.length);
     if (!group) throw new Error("请先在 IP 分组库添加至少一个节点。");
     const cue = { id: ids(), name: "新 Cue", ipGroupId: group.id, templateId: null, payload: "SCENE START",
-      encoding: "utf8", port: 7000, ping: false, reply: "IMOK", timeoutMs: 1800, onFail: "stop", retries: 0,
-      response: { mode: "none" } };
+      encoding: "utf8", port: null, ping: false, reply: "IMOK", timeoutMs: 1800, onFail: "stop", retries: 0,
+      response: { mode: "inherit" }, allowRetry: null };
     current.list.cues.push(cue);
     state.cueId = cue.id;
     dirty();
@@ -1254,8 +1396,9 @@ async function act(action, id, target) {
     if (action === "add-target") {
       const group = project.ipGroups.find(item => item.nodes.length && !commands.some(command => command.ipGroupId === item.id));
       if (!group) throw new Error("请先创建另一个包含节点的 IP 分组。");
-      const { templateId, payload, encoding, port } = commands.at(-1);
-      (cue.additionalTargets ??= []).push({ ipGroupId: group.id, templateId, payload, encoding, port, response: { mode: "none" } });
+      const previous = commands.at(-1);
+      const { templateId, payload, encoding, port, allowRetry } = previous;
+      (cue.additionalTargets ??= []).push({ ipGroupId: group.id, templateId, payload, encoding, port, allowRetry, response: { ...responseFor(cue, previous) } });
     } else {
       const index = Number(id);
       if (commands.length <= 1 || index < 0 || index >= commands.length) return;
@@ -1268,7 +1411,7 @@ async function act(action, id, target) {
     dirty();
   } else if (action === "delete-cue") {
     const index = current.list.cues.findIndex(cue => cue.id === id);
-    if (!confirm(`移除「${current.list.cues[index].name}」？`)) return;
+    if (!await confirmDialog(`移除「${current.list.cues[index].name}」？`)) return;
     current.list.cues.splice(index, 1);
     dirty();
   } else if (action === "up" || action === "down") {
@@ -1286,10 +1429,32 @@ async function act(action, id, target) {
   else if (action === "stop-selected") {
     return stopRun(state.runs.findLast(run => run.listId === id));
   }
-  else if (action === "fire-pad") return project.pads.find(pad => pad.id === id)?.action === "stopAll" ? stopAll() : run("/pad/" + id);
+  else if (action === "pad-stop") { const pad = project.pads.find(item => item.id === id); if (pad?.stopAction === "scene") return stopScene(pad.listId); return stopRun(state.runs.findLast(run => run.listId === pad?.listId)); }
+  else if (action === "stop-scene") return stopScene(id);
+  else if (action === "fire-pad") {
+    const pad = project.pads.find(pad => pad.id === id);
+    if (pad?.action === "stopAll") return stopAll();
+    if (pad?.action === "stopScene") return stopScene(pad.listId, "/pad/" + id);
+    return run("/pad/" + id);
+  }
   else if (action === "edit-ip-health") return editIpHealth(id);
   else if (action === "node-settings") return editNodeSettings(id);
   else if (action === "node-batch") return editNodeSettings(null);
+  else if (action === "reset-target-inheritance") {
+    const target = targets(selectedCue())[Number(id)];
+    target.port = null;
+    target.response = { mode: "inherit" };
+    target.allowRetry = null;
+    dirty();
+  }
+  else if (action === "delete-node") {
+    if (project.ipGroups.some(group => group.nodes.some(node => node.ip === id)))
+      throw new Error("请先将节点移出所属分组。");
+    if (await confirmDialog("删除节点台账中的 " + id + "？")) {
+      project.nodeLibrary = project.nodeLibrary.filter(node => node.ip !== id);
+      dirty();
+    }
+  }
   else if (action === "cue-node-override") return editCueNodeOverride(Number(id));
   else if (action === "dispatch-preview") return showDispatchPreview(id);
   else if (action === "edit-health-interval") {
@@ -1318,7 +1483,7 @@ async function act(action, id, target) {
     return;
   } else if (action === "export-ips") return exportIpLibrary(id);
   else if (action === "delete-current") {
-    if (!state.editorRemove?.()) return;
+    if (!await state.editorRemove?.()) return;
     $("editor").close();
     dirty();
   }
@@ -1360,7 +1525,8 @@ async function poll() {
   state.scheduleStatus = data.scheduleStatus;
   const scheduleError = state.scheduleStatus?.error ?? "";
   $("scheduleRecovery").hidden = !scheduleError;
-  if ($("scheduleRecovery").textContent !== scheduleError) $("scheduleRecovery").textContent = scheduleError;
+  if ($("scheduleRecoveryText").textContent !== scheduleError) $("scheduleRecoveryText").textContent = scheduleError;
+  $("scheduleRecover").hidden = !state.scheduleStatus?.needsRecovery;
   state.runs = data.runs ?? (data.active ? [data.active] : []);
   const countdowns = new Map();
   for (const run of state.runs) {
@@ -1440,6 +1606,11 @@ document.addEventListener("input", event => {
       else if (target.name === "responseEncoding") response.encoding = target.value;
       else response.timeoutMs = target.valueAsNumber || 0;
       entry.response = response;
+      dirty();
+      return;
+    }
+    if (groupCard && target.name === "allowRetry") {
+      entry.allowRetry = target.value === "" ? null : target.value === "true";
       dirty();
       return;
     }
@@ -1532,9 +1703,19 @@ $("save").addEventListener("click", async () => {
 });
 $("reload").addEventListener("click", async () => {
   if (state.saving) return;
-  if (state.dirty && !confirm("重新载入将丢弃未保存的更改。继续？")) return;
+  if (state.dirty && !await confirmDialog("重新载入将丢弃未保存的更改。继续？")) return;
   try { await load(); notice("已重新载入项目。"); }
   catch (error) { notice(error.message, true); }
+});
+$("scheduleRecover").addEventListener("click", async () => {
+  if (state.access.role !== "admin" || !state.scheduleStatus?.needsRecovery) return;
+  const count = state.scheduleStatus.attempts?.length ?? 0;
+  if (!await confirmDialog(`损坏的定时记录会另存为 .damaged 文件备查。\n已抢救 ${count} 条任务记录，用于避免重复起播。\n恢复后从下一分钟开始调度。\n\n已在「最近定时记录」中核对，确认恢复？`)) return;
+  try {
+    await request("/schedule/recover", "POST");
+    await poll();
+    notice("定时记录已恢复，定时触发继续运行。");
+  } catch (error) { notice(error.message, true); }
 });
 $("stop").addEventListener("click", async () => {
   try { await stopAll(); }
@@ -1567,7 +1748,7 @@ $("logSettings").addEventListener("click", () => {
 });
 $("clearLogs").addEventListener("click", async () => {
   if (state.access.role !== "admin" || state.clearingLogs || !state.logCount ||
-      !confirm("清空当前日志列表？已保存的 TXT 可在日志文件夹查看。")) return;
+      !await confirmDialog("清空当前日志列表？已保存的 TXT 可在日志文件夹查看。")) return;
   state.clearingLogs = true;
   $("clearLogs").disabled = true;
   try {

@@ -17,25 +17,26 @@ internal sealed record UdpRoute(string Network, string InterfaceId);
 internal sealed record Show(string Id, string Name, ShowGroup[] Groups);
 internal sealed record ShowGroup(string Id, string Name, CueList[] Lists);
 internal sealed record CueList(string Id, string Name, Cue[] Cues,
-    string PlaybackMode = "once", int IntervalMs = 0, string PlaybackGroup = "默认")
+    string PlaybackMode = "once", int IntervalMs = 0, string PlaybackGroup = "默认", string? StopListId = null,
+    string[]? ControlZones = null)
 {
     public int DelayAfter(Cue cue) => cue.DelayAfterMs ?? IntervalMs;
 }
 internal sealed record Cue(string Id, string Name, string IpGroupId, string? TemplateId, string Payload,
     string Encoding, int? Port, bool Ping, string Reply, int TimeoutMs, string OnFail, int Retries,
     CueTarget[]? AdditionalTargets = null, int? DelayAfterMs = null, ReplyPolicy? Response = null,
-    NodeCommandOverride[]? NodeOverrides = null)
+    NodeCommandOverride[]? NodeOverrides = null, bool? AllowRetry = null)
 {
     public IEnumerable<CueTarget> DispatchTargets()
     {
         var legacy = new ReplyPolicy("exact", Reply, TimeoutMs);
-        yield return new(IpGroupId, TemplateId, Payload, Encoding, Port, Response ?? legacy, NodeOverrides);
+        yield return new(IpGroupId, TemplateId, Payload, Encoding, Port, Response ?? legacy, NodeOverrides, AllowRetry);
         foreach (var target in AdditionalTargets ?? [])
             yield return target with { Response = target.Response ?? legacy };
     }
 }
 internal sealed record CueTarget(string IpGroupId, string? TemplateId, string Payload, string Encoding, int? Port,
-    ReplyPolicy? Response = null, NodeCommandOverride[]? NodeOverrides = null);
+    ReplyPolicy? Response = null, NodeCommandOverride[]? NodeOverrides = null, bool? AllowRetry = null);
 internal sealed record NodeCommandOverride(string Ip, string? TemplateId = null, int? Port = null, ReplyPolicy? Response = null);
 internal sealed record ReplyPolicy(string Mode, string? Text = null, int TimeoutMs = 1800, string Encoding = "utf8");
 internal sealed record IpGroup(string Id, string Name, Node[] Nodes);
@@ -46,11 +47,11 @@ internal sealed record NodeCommunication(int? TargetPort = null, int SenderPort 
 internal sealed record HealthQuery(int Port, string Payload, string Reply, string Match = "exact", int TimeoutMs = 800,
     string Encoding = "utf8", string ReplyEncoding = "utf8");
 internal sealed record CommandTemplate(string Id, string Name, string Payload, string Encoding,
-    ReplyPolicy? Response = null, int? Port = null);
+    ReplyPolicy? Response = null, int? Port = null, bool AllowRetry = false);
 internal sealed record Schedule(string Id, string Name, string ListId, string At, bool Enabled,
     string Mode = "weekly", DayOfWeek[]? Days = null, DateOnly? StartDate = null, DateOnly? EndDate = null,
     int CatchUpMinutes = 0);
-internal sealed record PadButton(string Id, string Name, string ListId, string Action = "play");
+internal sealed record PadButton(string Id, string Name, string ListId, string Action = "play", string? StopAction = null);
 internal sealed record Snapshot(long Revision, Project Project);
 internal sealed record ProjectBackup(string Id, string Name, long Revision, DateTimeOffset SavedAt);
 
@@ -101,6 +102,10 @@ internal static class ProjectRules
         {
             Identity(group.Id, group.Name);
             Limit(group.Nodes, 128);
+        }
+        var validationGroups = project.IpGroups.Append(new IpGroup("", "统一节点库", project.NodeLibrary ?? []));
+        foreach (var group in validationGroups)
+        {
             var seen = new HashSet<IPAddress>();
             foreach (var node in group.Nodes)
             {
@@ -150,6 +155,7 @@ internal static class ProjectRules
                         list.PlaybackGroup != list.PlaybackGroup.Trim())
                         throw new ArgumentException($"Cue 列表「{list.Name}」的播放组名称须为 1–80 个字符。");
                     Limit(list.Cues, 200);
+                    CheckZones(list);
                     if (list.PlaybackMode is not ("once" or "loop") || list.IntervalMs is < 0 or > MaxIntervalMs)
                         throw new ArgumentException($"Cue 列表「{list.Name}」需要有效的播放模式和 0–3600 秒的默认间隔。");
                     foreach (var cue in list.Cues)
@@ -183,7 +189,7 @@ internal static class ProjectRules
                             if (target.TemplateId is null)
                                 _ = Packet(target.Payload, target.Encoding);
                         }
-                        foreach (var item in DispatchPlan.Build(project, cue))
+                        foreach (var item in DispatchPlan.Build(project, cue, strict: false))
                         {
                             _ = Packet(item.Payload, item.Encoding);
                             DispatchPlan.CheckResponse(item.Response);
@@ -197,6 +203,12 @@ internal static class ProjectRules
             }
         }
         var listIds = project.Lists.Select(list => list.Id).ToHashSet();
+        foreach (var list in project.Lists)
+        {
+            if (list.StopListId is not null &&
+                (list.StopListId == list.Id || !project.Lists.Any(stop => stop.Id == list.StopListId && stop.Cues.Length > 0)))
+                throw new ArgumentException($"列表「{list.Name}」需要有效且非自身的现场停止流程。");
+        }
         foreach (var schedule in project.Schedules)
         {
             Identity(schedule.Id, schedule.Name);
@@ -219,7 +231,9 @@ internal static class ProjectRules
         foreach (var pad in project.Pads)
         {
             Identity(pad.Id, pad.Name);
-            if (pad.Action is not ("play" or "stopAll") || (pad.Action == "play" && !listIds.Contains(pad.ListId)))
+            if (pad.StopAction is not (null or "run" or "scene"))
+                throw new ArgumentException($"Action Pad「{pad.Name}」的停止按钮设置无效。");
+            if (pad.Action is not ("play" or "stopAll" or "stopScene") || (pad.Action != "stopAll" && !listIds.Contains(pad.ListId)))
                 throw new ArgumentException($"Action Pad「{pad.Name}」需要有效的 Cue 列表。");
         }
 
@@ -230,6 +244,16 @@ internal static class ProjectRules
                 id.Any(ch => !char.IsAsciiLetterOrDigit(ch) && ch != '-') || !ids.Add(id))
                 throw new ArgumentException("项目包含重复或无效的对象标识。");
         }
+    }
+
+    private static void CheckZones(CueList list)
+    {
+        var zones = list.ControlZones;
+        if (zones is null) return;
+        if (zones.Length > 20 || zones.Any(zone => string.IsNullOrWhiteSpace(zone) || zone.Length > 40 || zone != zone.Trim()) ||
+            zones.Distinct(StringComparer.OrdinalIgnoreCase).Count() != zones.Length ||
+            (zones.Contains(ControlScope.WholeNode) && zones.Length > 1))
+            throw new ArgumentException($"Cue 列表「{list.Name}」的控制分区须为 1–40 个字符且互不重复，整节点标记「*」不能与其他分区并用。");
     }
 
     private static void CheckAdapter(string id)

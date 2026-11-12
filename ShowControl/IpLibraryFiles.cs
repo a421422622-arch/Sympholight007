@@ -43,7 +43,7 @@ internal static class IpLibraryFiles
         };
     }
 
-    public static IpGroup[] Import(Stream file, string fileName, IpGroup[] current)
+    public static IpGroup[] Import(Stream file, string fileName, IpGroup[] current, Node[]? library = null)
     {
         CheckGroups(current);
         try
@@ -56,7 +56,7 @@ internal static class IpLibraryFiles
             };
             if (table.Length == 0)
                 throw new ArgumentException("文件没有可导入的内容。");
-            return Merge(current, Parse(table, Path.GetExtension(fileName).Equals(".txt", StringComparison.OrdinalIgnoreCase)));
+            return Merge(current, Parse(table, Path.GetExtension(fileName).Equals(".txt", StringComparison.OrdinalIgnoreCase)), library);
         }
         catch (Exception error) when (error is OpenXmlPackageException or InvalidDataException or
             XmlException or MalformedLineException or DecoderFallbackException)
@@ -65,11 +65,14 @@ internal static class IpLibraryFiles
         }
     }
 
-    private static IpGroup[] Merge(IpGroup[] current, IEnumerable<ImportedNode> rows)
+    private static IpGroup[] Merge(IpGroup[] current, IEnumerable<ImportedNode> rows, Node[]? extra)
     {
         var result = current.ToList();
         var matched = new HashSet<string>();
         var updates = new Dictionary<IPAddress, Node>();
+        var library = new Dictionary<IPAddress, Node>();
+        foreach (var known in current.SelectMany(group => group.Nodes).Concat(extra ?? []))
+            library.TryAdd(ProjectRules.ParseIp(known.Ip), known);
         foreach (var block in rows.GroupBy(row => row.Id.Length > 0 ? "id:" + row.Id : "name:" + row.Group))
         {
             var first = block.First();
@@ -96,11 +99,12 @@ internal static class IpLibraryFiles
                     continue;
                 if (!imported.Add(row.Ip))
                     throw new ArgumentException($"第 {row.Line} 行的 IP 地址在同一分组内重复。");
-                nodes.TryGetValue(row.Ip, out var previous);
+                if (!nodes.TryGetValue(row.Ip, out var previous))
+                    library.TryGetValue(row.Ip, out previous);
                 nodes[row.Ip] = new Node(previous?.Ip ?? row.Ip.ToString(),
                     row.Label ?? previous?.Label ?? "", row.Simulation ?? previous?.Simulation ?? "ok",
                     row.HealthSpecified ? row.Query : previous?.HealthQuery,
-                    row.CommunicationSpecified ? row.Communication : previous?.Communication,
+                    Patch(previous?.Communication, row.Communication),
                     row.PingEnabled ?? previous?.PingEnabled ?? true, row.Customized ?? previous?.Customized ?? false);
                 if (updates.TryGetValue(row.Ip, out var other) && other != nodes[row.Ip])
                     throw new ArgumentException($"第 {row.Line} 行的同一 IP 在多个分组中的节点设置不一致。");
@@ -118,6 +122,17 @@ internal static class IpLibraryFiles
         }).ToArray();
         CheckGroups(groups);
         return groups;
+    }
+
+    private static NodeCommunication? Patch(NodeCommunication? previous, CommunicationPatch change)
+    {
+        var target = change.Target.Apply(previous?.TargetPort);
+        var sender = change.Sender.Apply(previous?.SenderPort) ?? 0;
+        var receiver = change.Receiver.Apply(previous?.ReceiverPort);
+        var source = change.Source.Apply(previous?.ReplySourcePort);
+        var encoding = change.Encoding ?? previous?.ReceiveEncoding ?? "utf8";
+        return previous is null && target is null && sender == 0 && receiver is null && source is null && encoding == "utf8"
+            ? null : new NodeCommunication(target, sender, receiver, source, encoding);
     }
 
     private static ImportedNode[] Parse(TableRow[] table, bool allowPlainText)
@@ -177,9 +192,8 @@ internal static class IpLibraryFiles
                 return new ImportedNode(group, row.Get(idColumn), ip.Length > 0 ? ProjectRules.ParseIp(ip) : null,
                     label.Length == 0 ? null : label, simulation.Length == 0 ? null : simulation,
                     healthMode.Length > 0, query, row.Line,
-                    targetColumn >= 0 || senderColumn >= 0 || receiverColumn >= 0 || sourceColumn >= 0 || receiveEncodingColumn >= 0,
-                    new NodeCommunication(OptionalPort(targetColumn), OptionalPort(senderColumn) ?? 0, OptionalPort(receiverColumn), OptionalPort(sourceColumn),
-                        row.Get(receiveEncodingColumn) is { Length: > 0 } receiveEncoding ? receiveEncoding : "utf8"),
+                                        new CommunicationPatch(PortChange(targetColumn), PortChange(senderColumn), PortChange(receiverColumn), PortChange(sourceColumn),
+                        row.Get(receiveEncodingColumn) is { Length: > 0 } receiveEncoding ? receiveEncoding : null),
                     OptionalBool(pingColumn), OptionalBool(customColumn));
             }
             catch (ArgumentException error)
@@ -195,6 +209,8 @@ internal static class IpLibraryFiles
                     throw new ArgumentException($"第 {row.Line} 行包含无效端口或超时。");
                 return number;
             }
+            PortPatch PortChange(int column) =>
+                row.Get(column) == "-" ? new PortPatch(true, null) : new PortPatch(false, OptionalPort(column));
             bool? OptionalBool(int column)
             {
                 var value = row.Get(column);
@@ -323,6 +339,13 @@ internal static class IpLibraryFiles
     private static void CheckGroups(IpGroup[] groups) =>
         ProjectRules.Check(new Project("IP 分组库", [], groups, [], [], []));
 
+    private sealed record PortPatch(bool Clear, int? Value)
+    {
+        public int? Apply(int? previous) => Clear ? null : Value ?? previous;
+    }
+
+    private sealed record CommunicationPatch(PortPatch Target, PortPatch Sender, PortPatch Receiver, PortPatch Source, string? Encoding);
+
     private sealed record TableRow(long Line, string?[] Cells)
     {
         public string Raw(int index) => index >= 0 && index < Cells.Length ? Cells[index] ?? "" : "";
@@ -330,6 +353,6 @@ internal static class IpLibraryFiles
     }
 
     private sealed record ImportedNode(string Group, string Id, IPAddress? Ip, string? Label, string? Simulation,
-        bool HealthSpecified, HealthQuery? Query, long Line, bool CommunicationSpecified, NodeCommunication Communication,
+        bool HealthSpecified, HealthQuery? Query, long Line, CommunicationPatch Communication,
         bool? PingEnabled, bool? Customized);
 }

@@ -47,10 +47,39 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
             return new(false, "所选 Cue 列表没有可执行条目。");
 
 
+        return TriggerList(project, list, source);
+    }
+
+    public TriggerResult StopScene(Project project, string listId)
+    {
+        var owner = project.Lists.FirstOrDefault(item => item.Id == listId);
+        var stop = project.Lists.FirstOrDefault(item => item.Id == owner?.StopListId);
+        if (owner is null || stop is null || stop.Cues.Length == 0)
+            return new(false, "请先在列表设置中绑定已配置 LAS 停止指令的现场停止流程。");
+        var execution = stop with
+        {
+            Id = owner.Id,
+            Name = owner.Name + " · 现场停止",
+            PlaybackGroup = owner.PlaybackGroup,
+            PlaybackMode = "once"
+        };
+        return TriggerList(project, execution, "sceneStop");
+    }
+
+    private TriggerResult TriggerList(Project project, CueList list, string source)
+    {
         lock (gate)
         {
             if (lifetime.ApplicationStopping.IsCancellationRequested)
                 return new(false, "程序正在关闭。");
+            var conflicts = DispatchPlan.Conflicts(project, list);
+            if (conflicts.Length > 0)
+            {
+                var reason = "发送计划存在冲突，整个列表未执行：" + string.Join("；", conflicts.Take(3)) +
+                    (conflicts.Length > 3 ? $"（另有 {conflicts.Length - 3} 处）" : "");
+                Log(source, list.Name, "", "failed", reason);
+                return new(false, reason);
+            }
             var replaced = active.Values.Where(run => run.Info.ListId == list.Id ||
                 StringComparer.OrdinalIgnoreCase.Equals(run.Info.PlaybackGroup, list.PlaybackGroup)).ToArray();
             if (source == "schedule" && replaced.Any(run => run.Info.Source != "schedule" && !run.Cancel.IsCancellationRequested))
@@ -66,12 +95,25 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
             }
 
             var run = new Run(new(Guid.NewGuid(), list.Id, list.Name, source, DateTimeOffset.Now, list.PlaybackMode, list.PlaybackGroup),
-                CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping));
+                CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping), project, list);
             active[list.PlaybackGroup] = run;
             Log(source, list.Name, "", "queued", options.Live ? "已接受真实 UDP 执行。" : "已接受模拟执行。");
             run.Task = Task.Run(() => Execute(run, project, list, Task.WhenAll(replaced.Select(previous => previous.Task))));
             return new(true, "已接收执行请求。");
         }
+    }
+
+    public ScopeOverlap[] RunningOverlaps(Project project, string ownerListId)
+    {
+        var owner = project.Lists.FirstOrDefault(item => item.Id == ownerListId);
+        var stop = project.Lists.FirstOrDefault(item => item.Id == owner?.StopListId);
+        if (owner is null || stop is null) return [];
+        Run[] running;
+        lock (gate)
+            running = active.Values.Where(run => run.Info.ListId != owner.Id &&
+                !StringComparer.OrdinalIgnoreCase.Equals(run.Info.PlaybackGroup, owner.PlaybackGroup)).ToArray();
+        return running.Select(run => ControlScope.Overlap(project, stop, run.Project, run.List))
+            .OfType<ScopeOverlap>().ToArray();
     }
 
     public bool Stop(Guid runId)
@@ -125,10 +167,10 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
                     var ok = await PlayCue(project, list, cue, source, token);
                     token.ThrowIfCancellationRequested();
                     if (ok)
-                        Log(source, list.Name, cue.Name, "success", "目标指令执行完毕。");
+                        Log(source, list.Name, cue.Name, "success", "本条 Cue 的发送与回执处理完成，现场播放以节点上报或观测为准。");
                     else if (cue.OnFail != "skip")
                     {
-                        Log(source, list.Name, cue.Name, "stopped", cue.OnFail == "retry" ? "重试耗尽，Cue 列表已停止。" : "Cue 失败，Cue 列表已停止。");
+                        Log(source, list.Name, cue.Name, "stopped", "指令未确认，Cue 列表已停止，请查看逐节点发送和重试记录。");
                         return;
                     }
                     else
@@ -192,9 +234,8 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
     private async Task<bool> PlayCue(Project project, CueList list, Cue cue, string source, CancellationToken token)
     {
         var failed = 0;
-        var attempts = cue.OnFail == "retry" ? 1 + cue.Retries : 1;
         var dispatch = DispatchPlan.Build(project, cue).Select(item => new Dispatch(item.Group, item.Node,
-            ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response, item.Encoding))
+            ProjectRules.ParseIp(item.Node.Ip), item.Port, ProjectRules.Packet(item.Payload, item.Encoding), item.Response, item.Encoding, item.AllowRetry))
             .GroupBy(item => (item.Address, item.Port)).ToArray();
         var router = options.Live ? new UdpNetwork.Router(project) : null;
         await Parallel.ForEachAsync(dispatch, new ParallelOptions
@@ -207,6 +248,9 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
             foreach (var item in endpoint)
             {
                 var confirmed = false;
+                var attempts = cue.OnFail == "retry" && item.AllowRetry ? 1 + cue.Retries : 1;
+                if (cue.OnFail == "retry" && cue.Retries > 0 && !item.AllowRetry)
+                    Log(source, list.Name, cue.Name, "retryBlocked", $"{item.Node.Ip} · 命令未允许自动重试，本次最多发送一次。");
                 for (var attempt = 1; attempt <= attempts && !confirmed; attempt++)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -232,7 +276,7 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         return failed == 0;
     }
 
-    private sealed record Dispatch(string Group, Node Node, System.Net.IPAddress Address, int Port, byte[] Bytes, ReplyPolicy Response, string Encoding);
+    private sealed record Dispatch(string Group, Node Node, System.Net.IPAddress Address, int Port, byte[] Bytes, ReplyPolicy Response, string Encoding, bool AllowRetry);
 
     private async Task<bool> Send(Cue cue, Dispatch item, string? adapter, int adapterWaitSeconds, UdpContext context,
         Action<string, string> step, CancellationToken token)
@@ -240,13 +284,17 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
         try
         {
             if (options.Live)
-                return await transport.Exchange(item.Address, item.Port, item.Bytes, item.Encoding,
-                    item.Node.Communication, adapter, adapterWaitSeconds, item.Response, context, step, cue.Ping ? CheckPing : null, token);
+            {
+                var result = await transport.Exchange(item.Address, item.Port, item.Bytes, item.Encoding,
+                    item.Node.Communication, adapter, adapterWaitSeconds, item.Response, context, step, token);
+                if (cue.Ping) await CheckPing(token);
+                return result;
+            }
             token.ThrowIfCancellationRequested();
             var response = item.Response;
             step("send", $"模拟发送 {item.Bytes.Length} 字节 UDP · {DispatchPlan.DescribePayload(item.Bytes, item.Encoding)}" +
                 (response.Mode == "none" ? " · 不等待回执" : ""));
-            if (cue.Ping && !await CheckPing(token)) return false;
+            if (cue.Ping) await CheckPing(token);
             if (response.Mode == "none") return true;
             step("wait", $"等待回执 {response.Text}");
             await Task.Delay(item.Node.Simulation == "timeout" ? response.TimeoutMs : 140, token);
@@ -269,21 +317,22 @@ internal sealed class CueEngine(RuntimeOptions options, IHostApplicationLifetime
             return false;
         }
 
-        async Task<bool> CheckPing(CancellationToken ct)
+        async Task CheckPing(CancellationToken ct)
         {
             step("ping", "检查 ICMP Ping");
             var ok = (await NodeHealth.Probe(item.Node, options, ct)).Status == "online";
-            if (!ok) step("failed", "Ping 失败");
-            return ok;
+            if (!ok) step("networkWarning", "Ping 未确认可达，UDP 发送与回执结果独立记录。");
         }
     }
 
     private void Log(string source, string list, string cue, string status, string message) =>
         logStore.Append(new(DateTimeOffset.Now, source, list, cue, status, message));
 
-    private sealed class Run(ActiveRun info, CancellationTokenSource cancel)
+    private sealed class Run(ActiveRun info, CancellationTokenSource cancel, Project project, CueList list)
     {
         public ActiveRun Info { get; set; } = info;
+        public Project Project { get; } = project;
+        public CueList List { get; } = list;
         public long WaitStarted { get; set; }
         public CancellationTokenSource Cancel { get; } = cancel;
         public Task Task { get; set; } = Task.CompletedTask;
@@ -364,7 +413,7 @@ internal sealed class NodeHealth(RuntimeOptions options, UdpTransport transport,
                 query.Encoding, node.Communication, adapter, 0, new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding),
                 new("health", "", "软件健康查询", node.Label),
                 (status, message) => logStore.Append(new(DateTimeOffset.Now, "health", "", "软件健康查询", status,
-                    $"{node.Label} · {node.Ip}:{query.Port} · {message}")), null, token);
+                    $"{node.Label} · {node.Ip}:{query.Port} · {message}")), token);
         }
         catch (IOException) { return false; }
         catch (SocketException) { return false; }
@@ -435,19 +484,15 @@ internal static class ScheduleCalendar
         _ => 0
     };
 
-    public static int ActivePriority(Project project, DateOnly day)
+    public static int ActivePriority(Project project, DateOnly day, string playbackGroup)
     {
-        var playable = project.Lists.Where(list => list.Cues.Length > 0).Select(list => list.Id).ToHashSet();
+        var playable = project.Lists.Where(list => list.Cues.Length > 0 &&
+            StringComparer.OrdinalIgnoreCase.Equals(list.PlaybackGroup, playbackGroup))
+            .Select(list => list.Id).ToHashSet();
         return project.Schedules.Where(schedule => schedule.Enabled && playable.Contains(schedule.ListId))
             .Select(schedule => Priority(schedule, day)).DefaultIfEmpty(0).Max();
     }
 
-    public static string Mode(int priority) => priority switch
-    {
-        3 => "date",
-        2 => "holiday",
-        _ => "weekly"
-    };
 }
 
 internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine, ScheduleJournal journal,
@@ -471,6 +516,7 @@ internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine, Sched
     {
         var now = DateTimeOffset.Now;
         var minute = now.ToUnixTimeSeconds() / 60;
+        if (journal.RecoveredThroughMinute is long recovered && minute <= recovered) return;
         var previous = journal.Minute;
         var snapshot = store.Get();
         if (previous == minute && journal.Revision == snapshot.Revision) return;
@@ -484,12 +530,12 @@ internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine, Sched
             var due = DateTimeOffset.FromUnixTimeSeconds(cursor * 60).ToLocalTime();
             var day = DateOnly.FromDateTime(due.DateTime);
             var time = due.ToString("HH:mm");
-            var priority = ScheduleCalendar.ActivePriority(project, day);
             foreach (var schedule in project.Schedules.Where(schedule => schedule.Enabled && schedule.At == time))
             {
                 var taskPriority = ScheduleCalendar.Priority(schedule, day);
                 if (taskPriority == 0) continue;
                 var list = project.Lists.FirstOrDefault(list => list.Id == schedule.ListId && list.Cues.Length > 0);
+                var priority = list is null ? 0 : ScheduleCalendar.ActivePriority(project, day, list.PlaybackGroup);
                 if (journal.Find(schedule.Id, day) is { } recorded)
                 {
                     if (list is not null && recorded.Result is "accepted" or "pending") startedGroups.Add(list.PlaybackGroup);
@@ -500,7 +546,7 @@ internal sealed class ScheduleWorker(ProjectStore store, CueEngine engine, Sched
                 if (elapsedMinutes > schedule.CatchUpMinutes)
                     Skip(attempt with { Result = "missed" }, schedule, "已超过补播窗口。");
                 else if (taskPriority < priority)
-                    Skip(attempt, schedule, priority == 3 ? "节目模式：指定日任务优先。" : "节目模式：节假日任务优先。");
+                    Skip(attempt, schedule, priority == 3 ? "本播放组的指定日任务优先。" : "本播放组的节假日任务优先。");
                 else if (list is null)
                     Skip(attempt, schedule, "目标 Cue 列表为空。");
                 else if (startedGroups.Contains(list.PlaybackGroup))

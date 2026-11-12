@@ -73,6 +73,7 @@ app.Use(async (context, next) =>
     {
         var role = context.RequestServices.GetRequiredService<AccessControl>().View(SessionToken(context)).Role;
         var adminOnly = context.Request.Path.StartsWithSegments("/api/ip-library") ||
+            context.Request.Path.StartsWithSegments("/api/schedule") ||
             context.Request.Path.StartsWithSegments("/api/log-view") ||
             context.Request.Path.StartsWithSegments("/api/project/configuration") ||
             context.Request.Path.StartsWithSegments("/api/project/history") ||
@@ -202,7 +203,6 @@ api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine
     NodeHealth health, ExecutionLogStore logs, UdpTransport transport, ScheduleJournal schedule) =>
 {
     var active = engine.Status();
-    var priority = ScheduleCalendar.ActivePriority(store.Get().Project, DateOnly.FromDateTime(DateTime.Now));
     var view = access.View(SessionToken(context));
     var runs = view.Role is null ? [] : active;
     var logView = view.Role is null ? null : logs.View(logVersion);
@@ -216,20 +216,50 @@ api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine
         Access = view, HealthScan = view.Role is null ? null : health.Progress,
         LogStorageWarning = view.Role is not null && (logStatus.Error is not null || logStatus.LostEntries > 0),
         TimeZone = TimeZoneInfo.Local.Id,
-        ScheduleMode = ScheduleCalendar.Mode(priority) };
+        ScheduleMode = "grouped" };
 });
-api.MapPost("/run/{id}", (string id, ProjectStore store, CueEngine engine) =>
-    store.RequiresRecovery ? RecoveryRequired() : Result(engine.Trigger(store.Get().Project, id, "manual")));
-api.MapPost("/pad/{id}", (string id, ProjectStore store, CueEngine engine) =>
+api.MapPost("/run/{id}", (string id, long? revision, ProjectStore store, CueEngine engine) =>
 {
-    var project = store.Get().Project;
+    var snapshot = store.Get();
+    if (ExecutionGuard.Check(snapshot.Revision, revision) is { } stale)
+        return Results.Json(new { message = stale.Message }, statusCode: stale.Status);
+    return store.RequiresRecovery ? RecoveryRequired() : Result(engine.Trigger(snapshot.Project, id, "manual"));
+});
+api.MapPost("/stop-scene/{id}", (string id, long? revision, ProjectStore store, CueEngine engine) =>
+{
+    var snapshot = store.Get();
+    if (ExecutionGuard.Check(snapshot.Revision, revision) is { } stale)
+        return Results.Json(new { message = stale.Message }, statusCode: stale.Status);
+    return store.RequiresRecovery ? RecoveryRequired() : Result(engine.StopScene(snapshot.Project, id));
+});
+api.MapPost("/pad/{id}", (string id, long? revision, ProjectStore store, CueEngine engine) =>
+{
+    var snapshot = store.Get();
+    var project = snapshot.Project;
     var pad = project.Pads.FirstOrDefault(item => item.Id == id);
     if (pad is null) return Results.NotFound(new { message = "Action Pad 按钮不存在。" });
+    if (pad.Action != "stopAll" && ExecutionGuard.Check(snapshot.Revision, revision) is { } stale)
+        return Results.Json(new { message = stale.Message }, statusCode: stale.Status);
     if (pad.Action != "stopAll" && store.RequiresRecovery) return RecoveryRequired();
+    if (pad.Action == "stopScene") return Result(engine.StopScene(project, pad.ListId));
     if (pad.Action != "stopAll") return Result(engine.Trigger(project, pad.ListId, "pad"));
     var count = engine.StopAll();
     return Results.Ok(new { accepted = true, message = $"已请求停止 {count} 个播放列表。" });
 });
+api.MapPost("/schedule/recover", (ScheduleJournal schedule) =>
+{
+    try
+    {
+        schedule.Recover();
+        return Results.Ok(schedule.Status);
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        return Results.Json(new { message = "定时记录恢复失败，请检查数据目录。" }, statusCode: 500);
+    }
+});
+api.MapGet("/stop-scope/{id}", (string id, ProjectStore store, CueEngine engine) =>
+    Results.Ok(engine.RunningOverlaps(store.Get().Project, id)));
 api.MapPost("/stop", (CueEngine engine) =>
 {
     var count = engine.StopAll();
@@ -255,7 +285,9 @@ api.MapPost("/ip-library/import", async (HttpRequest request, CancellationToken 
         var groups = JsonSerializer.Deserialize<IpGroup[]>(form["groups"].ToString(), JsonSerializerOptions.Web)
             ?? throw new ArgumentException("当前 IP 分组库数据无效。");
         using var input = file.OpenReadStream();
-        return Results.Ok(IpLibraryFiles.Import(input, file.FileName, groups));
+        var library = form["library"].ToString() is { Length: > 0 } raw
+            ? JsonSerializer.Deserialize<Node?[]>(raw, JsonSerializerOptions.Web)?.OfType<Node>().ToArray() : null;
+        return Results.Ok(IpLibraryFiles.Import(input, file.FileName, groups, library));
     }
     catch (Exception error) when (error is ArgumentException or JsonException or InvalidDataException)
     {

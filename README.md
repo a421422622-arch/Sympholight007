@@ -11,3 +11,7 @@
 Windows 桌面版的构建和使用说明见 [桌面版文档](ShowControl/Desktop/README.md)。Windows 打包使用 .NET 10 和对应版本的官方 Electron 发行包。
 
 工程、权限设置、布局和日志保存在运行数据目录中。
+
+## 回归验证
+
+运行 `dotnet run --project tests/ShowControl.Regression`，验证目标去重、配置继承、排期优先级、重试保护和停止流程。UDP 测试使用本机回环地址。
