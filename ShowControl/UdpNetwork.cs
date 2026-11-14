@@ -8,9 +8,9 @@ internal static class UdpNetwork
 {
     private const SocketOptionName WindowsUnicastInterface = (SocketOptionName)31;
 
-    public static InterfaceEntry[] Interfaces(Project project)
+    public static InterfaceEntry[] Interfaces(Project project, bool includeInactive = false)
     {
-        var selected = (project.UdpRoutes ?? []).Select(route => route.InterfaceId).Append(project.UdpInterfaceId).ToHashSet();
+        var selected = project.SelectedUdpInterfaces.ToHashSet(StringComparer.Ordinal);
         return NetworkInterface.GetAllNetworkInterfaces().Select(adapter =>
         {
             var addresses = ReadAddresses(adapter);
@@ -18,12 +18,12 @@ internal static class UdpNetwork
             var up = adapter.OperationalStatus == OperationalStatus.Up;
             var usable = addresses.Any(item => item.Address.AddressFamily == AddressFamily.InterNetwork ||
                 !item.Address.IsIPv6LinkLocal);
-            if (!loopback && !selected.Contains(adapter.Id) && (!up || !usable))
+            if (!includeInactive && !loopback && !selected.Contains(adapter.Id) && (!up || !usable))
                 return null;
             var networks = addresses.Where(item => item.PrefixLength >= 0 && item.PrefixLength <= item.Address.GetAddressBytes().Length * 8)
                 .Select(item => NetworkOf(item.Address, item.PrefixLength).ToString()).Distinct().ToArray();
             return new InterfaceEntry(adapter.Id, loopback ? "本机回环" : adapter.Name, up,
-                addresses.Select(item => item.Address.ToString()).ToArray(), networks);
+                addresses.Select(item => item.Address.ToString()).ToArray(), networks, loopback);
         }).OfType<InterfaceEntry>().OrderByDescending(adapter => adapter.Up && adapter.Addresses.Length > 0)
             .ThenBy(adapter => adapter.Name).ToArray();
     }
@@ -168,6 +168,7 @@ internal static class UdpNetwork
         private readonly (IPNetwork Network, string Adapter)[] routes = (project.UdpRoutes ?? [])
             .Select(route => (Network: ParseSubnet(route.Network), Adapter: route.InterfaceId))
             .OrderByDescending(route => route.Network.PrefixLength).ToArray();
+        private readonly string? defaultAdapter = project.UdpInterfaceId ?? project.UdpProjectInterfaceIds?.FirstOrDefault();
 
         public string? Select(IPAddress destination)
         {
@@ -176,11 +177,11 @@ internal static class UdpNetwork
             foreach (var route in routes)
                 if (route.Network.BaseAddress.AddressFamily == destination.AddressFamily && route.Network.Contains(destination))
                     return route.Adapter;
-            return project.UdpInterfaceId;
+            return defaultAdapter;
         }
     }
 
-    internal sealed record InterfaceEntry(string Id, string Name, bool Up, string[] Addresses, string[] Networks);
+    internal sealed record InterfaceEntry(string Id, string Name, bool Up, string[] Addresses, string[] Networks, bool Loopback);
     internal sealed record LocalAddress(IPAddress Address, int PrefixLength);
     internal sealed record Binding(int Index, LocalAddress[] Addresses);
 }

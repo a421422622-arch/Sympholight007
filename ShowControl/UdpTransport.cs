@@ -9,7 +9,7 @@ internal sealed record UdpReceipt(DateTimeOffset At, string Ip, int SourcePort, 
     string Text, string Hex, string Disposition, string Source, string List, string Cue, string Group, string Encoding);
 internal sealed record UdpContext(string Source, string List, string Cue, string Group);
 
-internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, ExecutionLogStore logs) : BackgroundService
+internal sealed class UdpTransport(ProjectStore store, ExecutionLogStore logs) : BackgroundService
 {
     private readonly object gate = new();
     private readonly Dictionary<IPEndPoint, Listener> listeners = new();
@@ -129,9 +129,18 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
         {
             closing.Token.ThrowIfCancellationRequested();
             var key = new IPEndPoint(address, port);
-            if (!listeners.TryGetValue(key, out var listener))
+            var interfaceIndex = OperatingSystem.IsWindows() ? binding?.Index ?? 0 : 0;
+            var listener = listeners.GetValueOrDefault(key);
+            if (listener is not null && listener.InterfaceIndex != interfaceIndex)
             {
-                listener = new(key, UdpNetwork.Bind(address, port, binding)) { Keep = port != 0 };
+                if (listener.Users > 0)
+                    throw new SocketException((int)SocketError.AddressAlreadyInUse);
+                Close(listener);
+                listener = null;
+            }
+            if (listener is null)
+            {
+                listener = new(key, UdpNetwork.Bind(address, port, binding), interfaceIndex) { Keep = port != 0 };
                 listeners.Add(key, listener);
                 listener.ReceiveTask = Receive(listener);
             }
@@ -171,7 +180,9 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
                         (item.SourcePort is null || item.SourcePort == packet.RemoteEndPoint.Port));
                     var matched = pending is not null && DispatchPlan.Matches(packet.Buffer, pending.Response);
                     var context = pending?.Context ?? new UdpContext("udp", "", "", "");
-                    var node = store.Get().Project.IpGroups.SelectMany(group => group.Nodes).FirstOrDefault(node => node.Ip == ip.ToString());
+                    var project = store.Get().Project;
+                    var nodes = project.NodeLibrary?.AsEnumerable() ?? project.IpGroups.SelectMany(group => group.Nodes);
+                    var node = nodes.FirstOrDefault(node => node.Ip == ip.ToString());
                     var encoding = pending is not null && pending.Response.Mode != "hex" ? pending.Response.Encoding
                         : node?.Communication?.ReceiveEncoding ?? "utf8";
                     var receipt = new UdpReceipt(DateTimeOffset.Now, ip.ToString(), packet.RemoteEndPoint.Port,
@@ -215,7 +226,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
             do
             {
-                if (options.Live) Maintain();
+                Maintain();
             } while (await timer.WaitForNextTickAsync(stoppingToken));
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
@@ -237,7 +248,8 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
         var project = store.Get().Project;
         var router = new UdpNetwork.Router(project);
         var desired = new HashSet<IPEndPoint>();
-        foreach (var node in project.IpGroups.SelectMany(group => group.Nodes).DistinctBy(node => node.Ip))
+        var nodes = project.NodeLibrary?.AsEnumerable() ?? project.IpGroups.SelectMany(group => group.Nodes);
+        foreach (var node in nodes.DistinctBy(node => node.Ip))
         {
             var communication = node.Communication;
             if (communication is null || (communication.SenderPort == 0 && communication.ReceiverPort is null)) continue;
@@ -267,7 +279,7 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
                 listener.Keep = desired.Contains(listener.Key);
                 if (!listener.Keep && listener.Users == 0) Close(listener);
             }
-            var used = project.IpGroups.SelectMany(group => group.Nodes).Select(node => node.Ip).ToHashSet();
+            var used = nodes.Select(node => node.Ip).ToHashSet();
             foreach (var ip in latest.Keys.Where(ip => !used.Contains(ip)).ToArray()) latest.Remove(ip);
             foreach (var address in devices.Where(pair => pair.Value.Users == 0 && pair.Value.Remaining <= TimeSpan.Zero).Select(pair => pair.Key).ToArray())
                 devices.Remove(address);
@@ -282,10 +294,11 @@ internal sealed class UdpTransport(ProjectStore store, RuntimeOptions options, E
         public int CooldownMs { get; set; }
         public TimeSpan Remaining => TimeSpan.FromMilliseconds(CooldownMs) - Stopwatch.GetElapsedTime(CooldownStarted);
     }
-    private sealed class Listener(IPEndPoint key, UdpClient client)
+    private sealed class Listener(IPEndPoint key, UdpClient client, int interfaceIndex)
     {
         public IPEndPoint Key { get; } = key;
         public UdpClient Client { get; } = client;
+        public int InterfaceIndex { get; } = interfaceIndex;
         public IPEndPoint Local { get; } = (IPEndPoint)client.Client.LocalEndPoint!;
         public int Users { get; set; }
         public bool Keep { get; set; }

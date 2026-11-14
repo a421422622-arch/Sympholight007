@@ -15,7 +15,7 @@ internal static class IpLibraryFiles
     public const int MaxFileSize = 8 * 1024 * 1024;
     private const int MaxWorkbookSize = 24 * 1024 * 1024;
     private const int MaxRows = 12_801;
-    private static readonly string[] Headers = ["IP 分组", "IP 地址", "节点名称", "模拟状态", "分组 ID",
+    private static readonly string[] Headers = ["IP 分组", "IP 地址", "节点名称", "分组 ID",
         "健康模式", "查询端口", "查询指令", "预期回执", "默认目标端口", "本机发送端口", "独立接收端口",
         "网络Ping", "回执匹配", "查询超时ms", "单独设置", "回执源端口", "接收编码", "查询编码", "查询回执编码"];
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: true, throwOnInvalidBytes: true);
@@ -24,8 +24,8 @@ internal static class IpLibraryFiles
     {
         CheckGroups(groups);
         var rows = new[] { Headers }.Concat(groups.SelectMany(group => group.Nodes.Length == 0
-            ? new[] { new[] { group.Name, "", "", "", group.Id } }
-            : group.Nodes.Select(node => new[] { group.Name, node.Ip, node.Label, node.Simulation, group.Id,
+            ? new[] { new[] { group.Name, "", "", group.Id } }
+            : group.Nodes.Select(node => new[] { group.Name, node.Ip, node.Label, group.Id,
                 node.HealthQuery is null ? "ping" : "udp", node.HealthQuery?.Port.ToString(CultureInfo.InvariantCulture) ?? "",
                 node.HealthQuery?.Payload ?? "", node.HealthQuery?.Reply ?? "",
                 node.Communication?.TargetPort?.ToString(CultureInfo.InvariantCulture) ?? "",
@@ -102,7 +102,7 @@ internal static class IpLibraryFiles
                 if (!nodes.TryGetValue(row.Ip, out var previous))
                     library.TryGetValue(row.Ip, out previous);
                 nodes[row.Ip] = new Node(previous?.Ip ?? row.Ip.ToString(),
-                    row.Label ?? previous?.Label ?? "", row.Simulation ?? previous?.Simulation ?? "ok",
+                    row.Label ?? previous?.Label ?? "",
                     row.HealthSpecified ? row.Query : previous?.HealthQuery,
                     Patch(previous?.Communication, row.Communication),
                     row.PingEnabled ?? previous?.PingEnabled ?? true, row.Customized ?? previous?.Customized ?? false);
@@ -141,7 +141,6 @@ internal static class IpLibraryFiles
         var groupColumn = FindColumn(header, "IP 分组", "分组", "group");
         var ipColumn = FindColumn(header, "IP 地址", "IP", "ip address");
         var labelColumn = FindColumn(header, "节点名称", "名称", "label");
-        var simulationColumn = FindColumn(header, "模拟状态", "simulation");
         var idColumn = FindColumn(header, "分组 ID", "group id");
         var healthColumn = FindColumn(header, "健康模式", "health mode");
         var portColumn = FindColumn(header, "查询端口", "query port");
@@ -168,29 +167,28 @@ internal static class IpLibraryFiles
             var group = plainText ? "导入节点" : row.Get(groupColumn);
             var ip = row.Get(plainText ? 0 : ipColumn);
             var label = row.Get(labelColumn);
-            var simulation = row.Get(simulationColumn);
             var healthMode = row.Get(healthColumn).ToLowerInvariant();
             HealthQuery? query = null;
             if (healthMode == "udp")
             {
-                if (!int.TryParse(row.Get(portColumn), out var port) || port is < 1 or > 65535 ||
-                    string.IsNullOrWhiteSpace(row.Get(queryColumn)) || string.IsNullOrWhiteSpace(row.Get(replyColumn)))
-                    throw new ArgumentException($"第 {row.Line} 行的 UDP 健康模式须填写查询端口、查询指令和预期回执。");
                 var match = row.Get(matchColumn);
+                if (!int.TryParse(row.Get(portColumn), out var port) || port is < 1 or > 65535 ||
+                    string.IsNullOrWhiteSpace(row.Get(queryColumn)) ||
+                    (match == "exactStrict" ? row.Raw(replyColumn).Length == 0 : string.IsNullOrWhiteSpace(row.Get(replyColumn))))
+                    throw new ArgumentException($"第 {row.Line} 行的 UDP 健康模式须填写查询端口、查询指令和预期回执。");
                 var timeout = OptionalPort(timeoutColumn) ?? 800;
                 query = new HealthQuery(port, row.Raw(queryColumn), row.Raw(replyColumn), match.Length == 0 ? "exact" : match, timeout,
                     row.Get(queryEncodingColumn) is { Length: > 0 } queryEncoding ? queryEncoding : "utf8",
                     row.Get(replyEncodingColumn) is { Length: > 0 } replyEncoding ? replyEncoding : "utf8");
             }
             if (group.Length is 0 or > 80 || label.Length > 80 ||
-                simulation is not ("" or "ok" or "pingFail" or "timeout") ||
                 healthMode is not ("" or "ping" or "udp") ||
-                (ip.Length == 0 && (label.Length != 0 || simulation.Length != 0 || healthMode.Length != 0)))
-                throw new ArgumentException($"第 {row.Line} 行的分组、节点或模拟状态无效。");
+                (ip.Length == 0 && (label.Length != 0 || healthMode.Length != 0)))
+                throw new ArgumentException($"第 {row.Line} 行的分组或节点设置无效。");
             try
             {
                 return new ImportedNode(group, row.Get(idColumn), ip.Length > 0 ? ProjectRules.ParseIp(ip) : null,
-                    label.Length == 0 ? null : label, simulation.Length == 0 ? null : simulation,
+                    label.Length == 0 ? null : label,
                     healthMode.Length > 0, query, row.Line,
                                         new CommunicationPatch(PortChange(targetColumn), PortChange(senderColumn), PortChange(receiverColumn), PortChange(sourceColumn),
                         row.Get(receiveEncodingColumn) is { Length: > 0 } receiveEncoding ? receiveEncoding : null),
@@ -352,7 +350,7 @@ internal static class IpLibraryFiles
         public string Get(int index) => Raw(index).Trim();
     }
 
-    private sealed record ImportedNode(string Group, string Id, IPAddress? Ip, string? Label, string? Simulation,
+    private sealed record ImportedNode(string Group, string Id, IPAddress? Ip, string? Label,
         bool HealthSpecified, HealthQuery? Query, long Line, CommunicationPatch Communication,
         bool? PingEnabled, bool? Customized);
 }

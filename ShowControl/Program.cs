@@ -10,7 +10,6 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 });
 var port = int.TryParse(builder.Configuration["SHOWCONTROL_PORT"], out var value) && value is >= 1024 and <= 65535
     ? value : 8240;
-var options = new RuntimeOptions(builder.Configuration["SHOWCONTROL_LIVE"] == "1");
 var desktop = builder.Configuration["SHOWCONTROL_DESKTOP"] == "1";
 var desktopPort = int.TryParse(builder.Configuration["SHOWCONTROL_DESKTOP_PORT"], out var requestedPort) &&
     requestedPort is >= 1024 and <= 65535 ? requestedPort : 0;
@@ -24,10 +23,9 @@ builder.WebHost.ConfigureKestrel(server =>
     server.Limits.MaxRequestBodySize = 2 * 1024 * 1024;
 });
 builder.Services.AddSingleton(_ => new ProjectStore(directory));
-builder.Services.AddSingleton(_ => new ScheduleJournal(directory, options.Live));
+builder.Services.AddSingleton(_ => new ScheduleJournal(directory));
 builder.Services.AddSingleton(_ => new AccessControl(directory));
 builder.Services.AddSingleton(_ => new WorkspaceLayout(directory));
-builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(_ => new ExecutionLogStore(directory));
 builder.Services.AddHostedService(services => services.GetRequiredService<ExecutionLogStore>());
 builder.Services.AddSingleton<UdpTransport>();
@@ -133,7 +131,8 @@ api.MapPost("/log-view/clear", (ExecutionLogStore logs) =>
     logs.ClearView();
     return Results.NoContent();
 });
-api.MapGet("/udp-interfaces", (ProjectStore store) => UdpNetwork.Interfaces(store.Get().Project));
+api.MapGet("/udp-interfaces", (ProjectStore store, bool? includeInactive) =>
+    UdpNetwork.Interfaces(store.Get().Project, includeInactive == true));
 api.MapPut("/layout", (WorkspaceLayout layout, JsonElement data) =>
 {
     try
@@ -199,7 +198,7 @@ api.MapPut("/project", (Snapshot edit, ProjectStore store) =>
         return Results.BadRequest(new { message = error.Message });
     }
 });
-api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine, RuntimeOptions settings, ProjectStore store, AccessControl access,
+api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine, ProjectStore store, AccessControl access,
     NodeHealth health, ExecutionLogStore logs, UdpTransport transport, ScheduleJournal schedule) =>
 {
     var active = engine.Status();
@@ -207,7 +206,7 @@ api.MapGet("/status", (HttpContext context, string? logVersion, CueEngine engine
     var runs = view.Role is null ? [] : active;
     var logView = view.Role is null ? null : logs.View(logVersion);
     var logStatus = logs.Status;
-    return new { settings.Live, Active = runs.FirstOrDefault(), Runs = runs,
+    return new { Active = runs.FirstOrDefault(), Runs = runs,
         Events = logView is null ? [] : logView.Events, ActiveCount = active.Length,
         LogVersion = logView?.Version, LogMaxRows = logView?.MaxRows,
         ReceiptVersion = view.Role is null ? 0 : transport.Version,
@@ -266,6 +265,7 @@ api.MapPost("/stop", (CueEngine engine) =>
     return Results.Ok(new { stopped = count > 0, count });
 });
 api.MapPost("/stop/{id:guid}", (Guid id, CueEngine engine) => Results.Ok(new { stopped = engine.Stop(id) }));
+api.MapPost("/stop-list/{id}", (string id, CueEngine engine) => Results.Ok(new { stopped = engine.StopList(id) }));
 api.MapGet("/health", (ProjectStore store, NodeHealth health) => health.Get(store.Get().Project));
 api.MapPost("/health/refresh", async (ProjectStore store, NodeHealth health, CancellationToken token) =>
     store.RequiresRecovery ? RecoveryRequired() : Results.Ok(await health.Refresh(store.Get().Project, token)));

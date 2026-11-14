@@ -8,13 +8,13 @@ const ids = () => crypto.randomUUID();
 const policies = { retry: "重试", skip: "跳过", stop: "停止列表" };
 const healthLabels = { online: "在线", offline: "离线", unknown: "待检测" };
 const softwareLabels = { online: "在线", unconfirmed: "未确认", unknown: "待检测", notConfigured: "未配置" };
-const replyModes = { none: "不等待回执", exact: "文本完全匹配", contains: "文本包含", hex: "HEX 字节匹配" };
+const replyModes = { none: "不等待回执", exactStrict: "文本完全匹配（严格）", exact: "文本匹配（忽略首尾空白）", contains: "文本包含", hex: "HEX 字节匹配" };
 const stringEncodings = [["utf8", "UTF-8"], ["ascii", "ASCII"], ["gbk", "GBK / ANSI 936"], ["windows1252", "Windows-1252 / ANSI"]];
 const packetEncodings = [...stringEncodings.map(([id, name]) => [id, "String · " + name]), ["hex", "HEX · 原始字节"]];
 const defaultLayout = { order: ["project", "workspace", "properties", "log"], sizes: {} };
 const adminActions = new Set(["rename-project", "edit-show", "add-group", "edit-group", "add-list", "edit-list",
   "add-cue", "add-target", "remove-target", "delete-cue", "up", "down", "edit-resource", "delete-resource",
-  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "delete-node", "reset-target-inheritance", "cue-node-override", "project-export", "project-import", "project-restore"]);
+  "delete-current", "import-ips", "export-ips", "edit-ip-health", "edit-health-interval", "node-settings", "node-batch", "delete-node", "reset-target-inheritance", "cue-node-override", "project-export", "project-import", "project-restore", "cue-apply", "cue-discard"]);
 const scheduleModes = { grouped: "各播放组独立判断", weekly: "平日 · 周循环", date: "节目 · 指定日", holiday: "节目 · 节假日" };
 const weekdays = [[1, "一"], [2, "二"], [3, "三"], [4, "四"], [5, "五"], [6, "六"], [0, "日"]];
 const sourceLabels = { manual: "手动播放", pad: "Action Pad", schedule: "定时任务", health: "软件检测", sceneStop: "现场停止", udp: "UDP 回传" };
@@ -30,7 +30,7 @@ const state = {
   logVersion: null, logMaxRows: 300, logCount: 0, clearingLogs: false,
   project: null, revision: 0, dirty: false, tab: "cues", listId: null, cueId: null,
   health: [], filters: { search: "", group: "", status: "" }, runs: [], timezone: "", scheduleMode: "weekly",
-  editor: null, saving: false, editCounter: 0, stoppingRuns: new Set(), stoppingAll: false,
+  editor: null, saving: false, savedProject: null, stoppingLists: new Set(), stoppingAll: false,
   countdowns: new Map(), importingIps: false, access: { configured: false, role: null },
   layout: defaultLayout, layoutSaving: false, treePage: 1, treeOpen: new Map(),
   healthPage: 1, healthPageSize: 25, healthScan: null, healthVersion: -1, receiptVersion: -1, healthFetching: false
@@ -46,8 +46,8 @@ function notice(message, error = false) {
   noticeTimer = setTimeout(() => { $("notice").hidden = true; }, error ? 11000 : 3600);
 }
 
-async function request(url, method = "GET", data) {
-  const options = { method };
+async function request(url, method = "GET", data, signal) {
+  const options = { method, signal };
   if (data instanceof FormData) {
     options.body = data;
   } else if (data !== undefined) {
@@ -99,18 +99,29 @@ function linkNodes(preferGroups = false) {
   state.project.nodeLibrary = [...nodes.values()];
 }
 
+function wireTextField(label, name, value, options) {
+  const encoded = (value ?? "").replace(/[\\\r\n\t]/g, character =>
+    ({ "\\": "\\\\", "\r": "\\r", "\n": "\\n", "\t": "\\t" })[character]);
+  return field(label + "（\\r 回车，\\n 换行，\\t 制表，\\\\ 反斜杠）", name, encoded, options);
+}
+
+function readWireText(value) {
+  return (value ?? "").replace(/\\([rnt\\])/g, (_, character) =>
+    ({ r: "\r", n: "\n", t: "\t", "\\": "\\" })[character]);
+}
+
 function replyFields(policy = { mode: "none" }, prefix = "") {
   return field("回执匹配", prefix + "mode", policy.mode, { choices: Object.entries(replyModes) }) +
     field("String 回执编码（HEX 匹配时忽略）", prefix + "encoding", policy.encoding ?? "utf8", { choices: stringEncodings }) +
-    field("预期回执（不等待时可留空）", prefix + "text", policy.text ?? "") +
+    wireTextField("预期回执", prefix + "text", policy.text) +
     field("超时 (ms)", prefix + "timeoutMs", policy.timeoutMs ?? 1800, { type: "number", min: 100, max: 30000 });
 }
 
 function readReply(data, prefix = "") {
   const mode = data.get(prefix + "mode");
   if (mode === "none") return { mode };
-  const text = data.get(prefix + "text"), timeoutMs = Number(data.get(prefix + "timeoutMs"));
-  if (!text?.trim() || !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000)
+  const text = readWireText(data.get(prefix + "text")), timeoutMs = Number(data.get(prefix + "timeoutMs"));
+  if (!(mode === "exactStrict" ? text : text.trim()) || !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000)
     throw new Error("请填写回执内容和 100–30000 ms 超时。");
   if (mode === "hex" && !/^(?:[0-9a-fA-F]{2})+$/.test(text.replace(/\s/g, "")))
     throw new Error("HEX 回执需要完整的十六进制字节。");
@@ -132,15 +143,51 @@ function ensureSelection() {
 }
 
 function dirty() {
-  state.editCounter++;
   state.dirty = true;
-  updateSave();
+  updateCueConfirmation();
   queueEffectiveSettings();
 }
 
-function updateSave() {
-  $("save").disabled = !state.dirty || state.saving;
-  $("save").textContent = state.saving ? "保存中…" : state.dirty ? "保存项目 *" : "保存项目";
+function updateCueConfirmation() {
+  const confirmation = $("cueConfirmation");
+  if (!confirmation) return;
+  confirmation.hidden = !state.dirty || state.access.role !== "admin";
+  confirmation.querySelectorAll("button").forEach(button => { button.disabled = state.saving; });
+}
+
+function discardProjectEdit() {
+  state.project = structuredClone(state.savedProject);
+  state.dirty = false;
+  linkNodes();
+  render();
+}
+
+function acceptProject(snapshot) {
+  state.project = snapshot.project;
+  state.revision = snapshot.revision;
+  state.dirty = false;
+  linkNodes();
+  state.savedProject = structuredClone(state.project);
+}
+
+async function persistProject({ retainDraft = false } = {}) {
+  if (state.saving) throw new Error("正在应用设置，请稍候。");
+  state.saving = true;
+  $("propertiesPanel").inert = true;
+  updateCueConfirmation();
+  try {
+    acceptProject(await request("/project", "PUT", { revision: state.revision, project: state.project }));
+    render();
+    notice("改动已生效。");
+  } catch (error) {
+    if (!retainDraft) discardProjectEdit();
+    if (error.status === 409) throw new Error("工程已在其他窗口更新。本次改动未生效，请重新载入后再修改。");
+    throw new Error("改动未生效。" + error.message);
+  } finally {
+    state.saving = false;
+    $("propertiesPanel").inert = false;
+    updateCueConfirmation();
+  }
 }
 
 function option(value, label, selected = "") {
@@ -160,7 +207,7 @@ function table(headers, rows, empty = "暂无记录") {
 }
 
 function heading(title, hint, actions = "", breadcrumb = "") {
-  return `<div class="section-top"><div><div class="breadcrumb">${esc(breadcrumb || "02 / 工作区")}</div><h1>${esc(title)}</h1><p>${esc(hint)}</p></div><div class="actions">${actions}</div></div>`;
+  return `<div class="section-top"><div>${breadcrumb ? `<div class="breadcrumb">${esc(breadcrumb)}</div>` : ""}<h1>${esc(title)}</h1><p>${esc(hint)}</p></div>${actions ? `<div class="actions">${actions}</div>` : ""}</div>`;
 }
 
 function pageView(items, page, size) {
@@ -233,7 +280,7 @@ function render() {
   else renderResource();
   applyLayout();
   updateTransport();
-  updateSave();
+  updateCueConfirmation();
   queueEffectiveSettings();
 }
 
@@ -243,19 +290,21 @@ function applyLayout(layout = state.layout) {
   if ([...panels.keys()].join() !== layout.order.join())
     layout.order.forEach(id => grid.append(panels.get(id)));
   const visible = layout.order.filter(id => !panels.get(id).hidden);
-  const widths = { project: "clamp(175px, 17vw, 224px)", properties: "clamp(215px, 22vw, 288px)",
+  const widths = { project: "clamp(174px, 16vw, 228px)", properties: "clamp(210px, 23vw, 320px)",
     workspace: "minmax(0,1fr)", log: "minmax(0,1fr)" };
   for (const [id, panel] of panels) {
     const size = layout.sizes?.[id];
     panel.classList.toggle("dock-wide", id === visible.at(-1));
     panel.classList.toggle("sized-width", size?.width != null);
-    panel.classList.toggle("sized-height", size?.height != null);
     panel.style.setProperty("--panel-width", size?.width == null ? "" : `${size.width}px`);
     panel.style.setProperty("--panel-height", size?.height == null ? "" : `${size.height}px`);
     panel.style.setProperty("--panel-inset-x", size?.insetX == null ? "" : `${size.insetX}px`);
     panel.style.setProperty("--panel-inset-y", size?.insetY == null ? "" : `${size.insetY}px`);
   }
-  grid.style.setProperty("--dock-columns", visible.slice(0, -1).map(id => {
+  const columns = visible.slice(0, -1);
+  const flexible = ["workspace", "log"].find(id => columns.includes(id)) ?? columns.at(-1);
+  grid.style.setProperty("--dock-columns", columns.map(id => {
+    if (id === flexible) return "minmax(min(240px, 30%), 1fr)";
     const size = layout.sizes?.[id];
     return size?.width == null ? widths[id] : `minmax(0,${size.width + (size.insetX ?? 0)}px)`;
   }).join(" "));
@@ -279,39 +328,37 @@ function swapPanels(first, second) {
   return saveLayout({ ...state.layout, order });
 }
 
-function resizedLayout(id, bounds, dx, dy) {
-  const size = { ...state.layout.sizes?.[id] };
-  if (dx) size.width = Math.round(Math.max(140, Math.min(2400, bounds.width + dx)));
-  if (dy) size.height = Math.round(Math.max(110, Math.min(2400, bounds.height + dy)));
-  return { ...state.layout, sizes: { ...state.layout.sizes, [id]: size } };
-}
-
 function resizeContext(panel, edge) {
+  const grid = $("panelGrid");
+  const styles = getComputedStyle(grid);
+  const columnGap = parseFloat(styles.columnGap) || 0;
+  const rowGap = parseFloat(styles.rowGap) || 0;
+  const rightLimit = grid.getBoundingClientRect().right - parseFloat(styles.paddingRight);
   const id = panel.dataset.panel;
   const bounds = panel.getBoundingClientRect();
-  const peers = [...$("panelGrid").children].filter(other => other !== panel && !other.hidden)
+  const peers = [...grid.children].filter(other => other !== panel && !other.hidden)
     .map(other => ({ id: other.dataset.panel, bounds: other.getBoundingClientRect() }));
   const near = (a, b) => Math.abs(a - b) <= 2;
   const verticalOverlap = rect => rect.top < bounds.bottom && rect.bottom > bounds.top;
   const horizontalOverlap = rect => rect.left < bounds.right && rect.right > bounds.left;
+  const sameRow = peers.filter(({ bounds: rect }) => verticalOverlap(rect));
   let neighbor = null;
   if (edge === "left" || edge === "right") {
-    neighbor = peers.find(({ bounds: rect }) => verticalOverlap(rect) &&
-      (edge === "left" ? near(rect.right, bounds.left) : near(rect.left, bounds.right)));
+    neighbor = sameRow.find(({ bounds: rect }) =>
+      (edge === "left" ? near(rect.right + columnGap, bounds.left) : near(rect.left - columnGap, bounds.right)));
   }
   let above = [];
   if (edge === "top") {
     const row = peers.filter(({ bounds: rect }) => horizontalOverlap(rect) && rect.bottom <= bounds.top + 2 &&
       rect.top < bounds.top - 2);
-    const touching = row.find(({ bounds: rect }) => near(rect.bottom, bounds.top));
+    const touching = row.find(({ bounds: rect }) => near(rect.bottom + rowGap, bounds.top));
     if (touching) above = row.filter(({ bounds: rect }) => rect.bottom > touching.bounds.top);
   }
-  return { id, bounds, edge, neighbor, above };
+  return { id, bounds, edge, neighbor, sameRow, rightLimit, above, rowGap };
 }
 
 function resizeFromEdge(context, dx, dy) {
-  const { id, bounds, edge, neighbor, above } = context;
-  if (!edge) return resizedLayout(id, bounds, dx, dy);
+  const { id, bounds, edge, neighbor, sameRow, rightLimit, above, rowGap } = context;
   const sizes = { ...state.layout.sizes };
   const set = (panel, size) => { sizes[panel] = { ...sizes[panel], ...size }; };
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -329,13 +376,19 @@ function resizeFromEdge(context, dx, dy) {
       const change = clamp(dx, Math.max(-inset, bounds.width - 2400), Math.min(2400 - inset, bounds.width - 140));
       set(id, { width: Math.round(bounds.width - change), insetX: Math.round(inset + change) });
     } else {
-      set(id, { width: Math.round(clamp(bounds.width + dx, 140, 2400)) });
+      const width = Math.round(clamp(bounds.width + dx, 140, Math.min(2400, rightLimit - bounds.left)));
+      if (width !== Math.round(bounds.width)) {
+        for (const peer of sameRow)
+          if (sizes[peer.id]?.width == null) set(peer.id, { width: Math.round(clamp(peer.bounds.width, 140, 2400)) });
+        set(id, { width });
+      }
     }
   } else if (edge === "top" && above.length) {
-    const touching = above.filter(({ bounds: rect }) => Math.abs(rect.bottom - bounds.top) <= 2);
-    const change = clamp(dy, Math.max(bounds.height - 2400, ...above.map(({ bounds: rect }) => rect.top + 110 - bounds.top)),
+    const divider = bounds.top - rowGap;
+    const touching = above.filter(({ bounds: rect }) => Math.abs(rect.bottom - divider) <= 2);
+    const change = clamp(dy, Math.max(bounds.height - 2400, ...above.map(({ bounds: rect }) => rect.top + 110 - divider)),
       Math.min(bounds.height - 110, ...touching.map(({ bounds: rect }) => 2400 - rect.height)));
-    const boundary = bounds.top + change;
+    const boundary = divider + change;
     for (const item of above)
       if (item.bounds.bottom > boundary || touching.includes(item))
         set(item.id, { height: Math.round(clamp(boundary - item.bounds.top, 110, 2400)) });
@@ -357,6 +410,7 @@ function applyAccess(access) {
   document.body.classList.toggle("operator", access.role === "operator");
   $("lock").textContent = "锁屏";
   $("permissions").textContent = access.configured ? "权限" : "设置权限";
+  if (locked) $("workbenchSettings").open = false;
   $("appTop").inert = $("panelGrid").inert = locked;
   $("lockScreen").hidden = !locked;
   if (locked && $("editor").open) $("editor").close();
@@ -365,7 +419,7 @@ function applyAccess(access) {
 }
 
 async function lockAccess() {
-  if (state.dirty || state.saving) throw new Error("请先保存或重新载入工程，再锁屏。");
+  if (state.dirty || state.saving) throw new Error("请先确认或取消当前修改，再锁屏。");
   applyAccess(await request("/access/lock", "POST"));
   await poll();
 }
@@ -390,28 +444,28 @@ function editPermissions(lockAfter = false) {
 
 async function editUdpAdapter() {
   if (!state.project || state.access.role !== "admin") return;
-  const adapters = await request("/udp-interfaces");
-  if (state.access.role !== "admin" || $("editor").open) return;
-  const current = state.project.udpInterfaceId ?? "";
-  const routes = state.project.udpRoutes ?? [];
-  const choices = adapters.map(adapter => [adapter.id,
-    `${adapter.name} · ${adapter.up && adapter.addresses.length ? adapter.addresses.join(" / ") : "未就绪"}`]);
-  const known = new Set(choices.map(([id]) => id));
-  for (const id of new Set([current, ...routes.map(route => route.interfaceId)]))
-    if (id && !known.has(id)) choices.push([id, `已保存网卡 · 当前未检测到 · ${id}`]);
-  const suggested = [...new Set(adapters.flatMap(adapter => adapter.networks ?? []))];
+  if ($("editor").open) return;
+  const project = state.project;
+  const current = project.udpInterfaceId ?? "";
+  const routes = project.udpRoutes ?? [];
+  const selected = new Set(project.udpProjectInterfaceIds ?? [current, ...routes.map(route => route.interfaceId)].filter(Boolean));
+  let projectSelection = project.udpProjectInterfaceIds != null;
   const routeRow = (route = {}) => '<div class="udp-route" data-udp-route>' +
     field("目标网段", "network", route.network ?? "", { required: true, placeholder: "192.168.10.0/24", suggestions: "udpNetworks" }) +
-    field("发送网卡", "interfaceId", route.interfaceId ?? "", { choices: [["", "请选择网卡"], ...choices] }) +
+    field("发送网卡", "interfaceId", "", { choices: [["", "请选择网卡"]] }) +
     '<button type="button" class="button quiet" data-remove-route>移除</button></div>';
-  edit("UDP 网卡与网段",
-    table(["当前本机网卡", "地址", "状态"], adapters.map(adapter => `<tr><td>${esc(adapter.name)}</td><td>${esc(adapter.addresses.join(" / ") || "—")}</td><td>${adapter.up && adapter.addresses.length ? "可用" : "未就绪"}</td></tr>`).join("")) +
-    field("网卡等待上限 (s)", "adapterWaitSeconds", state.project.adapterWaitSeconds ?? 15, { type: "number", min: 1, max: 300, required: true }) +
-    field("未匹配网段的默认网卡", "adapter", current, { choices: [["", "系统自动路由"], ...choices] }) +
+  edit("UDP 网卡",
+    '<div class="udp-adapter-tools"><button type="button" class="button" id="refreshUdpAdapters">查询本机网卡</button>' +
+    '<label class="check"><input type="checkbox" id="showInactiveUdpAdapters">显示未就绪网卡</label>' +
+    '<span id="udpAdapterStatus" class="property-help" role="status"></span></div><div id="udpAdapterTable"></div>' +
+    '<p class="property-help">勾选本工程使用的网卡。「应用」后保存到工程，断线时保留勾选，重连后自动恢复使用。</p>' +
+    field("默认发送网卡", "adapter", "", { choices: [["", "系统自动路由"]] }) +
+    field("网卡恢复等待上限 (s)", "adapterWaitSeconds", project.adapterWaitSeconds ?? 15, { type: "number", min: 1, max: 300, required: true }) +
+    '<h3 class="cue-checks">按目标网段指定网卡</h3>' +
     '<div id="udpRoutes">' + routes.map(route => routeRow(route)).join("") + "</div>" +
     '<button type="button" class="button quiet" id="addUdpRoute">＋ 添加网段与网卡</button>' +
-    `<datalist id="udpNetworks">${suggested.map(network => option(network, network)).join("")}</datalist>` +
-    '<p class="property-help">127.0.0.1 和 ::1 始终走本机回环。其他目标按最具体的网段匹配网卡。保存工程后用于新触发的列表与软件健康查询。</p>',
+    '<datalist id="udpNetworks"></datalist>' +
+    '<p class="property-help">127.0.0.1 和 ::1 自动使用本机回环。其他目标优先匹配最具体的网段，其余走默认发送网卡。应用后用于新触发的播放与软件健康查询。</p>',
     data => {
       const routes = [...$("udpRoutes").querySelectorAll("[data-udp-route]")].map(row => ({
         network: row.querySelector('[name="network"]').value.trim(),
@@ -419,22 +473,137 @@ async function editUdpAdapter() {
       }));
       if (routes.some(route => !route.network || !route.interfaceId)) throw new Error("请为每条规则填写目标网段和发送网卡。");
       if (routes.length > 128) throw new Error("最多配置 128 条 UDP 网段规则。");
-      Object.assign(state.project, { udpInterfaceId: data.get("adapter") || null, udpRoutes: routes, adapterWaitSeconds: Number(data.get("adapterWaitSeconds")) });
+      Object.assign(state.project, {
+        udpInterfaceId: data.get("adapter") || null, udpRoutes: routes,
+        udpProjectInterfaceIds: projectSelection ? [...selected] : null,
+        adapterWaitSeconds: Number(data.get("adapterWaitSeconds"))
+      });
     });
+  const editor = $("editor");
+  editor.classList.add("wide-editor");
+  const adapterTable = $("udpAdapterTable");
+  const refresh = $("refreshUdpAdapters");
+  const showInactive = $("showInactiveUdpAdapters");
+  const status = $("udpAdapterStatus");
+  const routeFields = $("udpRoutes");
+  const defaultSelect = $("editForm").elements.adapter;
+  const availability = adapter => !adapter.up ? "未连接" : adapter.addresses.length ? "可用" : "无 IP 地址";
+  const lastNames = new Map();
+  let adapters = null;
+  let querying = false;
+
+  function shownAdapters() {
+    const visible = (adapters ?? []).filter(adapter => showInactive.checked || selected.has(adapter.id) ||
+      adapter.loopback || (adapter.up && adapter.addresses.length));
+    for (const id of selected) {
+      if (!visible.some(adapter => adapter.id === id))
+        visible.push({ id, name: lastNames.get(id) ?? id, addresses: [], networks: [], missing: true });
+    }
+    return visible;
+  }
+
+  function updateSelect(select, value) {
+    const first = projectSelection ? selected.values().next().value : null;
+    const empty = select !== defaultSelect ? "请选择已勾选的网卡" :
+      first ? `首张已勾选网卡 · ${lastNames.get(first) ?? first}` : "系统自动路由";
+    const choices = shownAdapters().filter(adapter => selected.has(adapter.id)).map(adapter => [adapter.id,
+      `${adapter.name} · ${adapter.missing ? "未检测到" : availability(adapter)}`]);
+    select.replaceChildren(new Option(empty, ""), ...choices.map(([id, label]) => new Option(label, id)));
+    select.value = value;
+  }
+
+  function renderAdapters() {
+    const routed = new Set([...routeFields.querySelectorAll("select")].map(select => select.value));
+    const fallback = defaultSelect.value || (projectSelection ? selected.values().next().value : null);
+    const rows = shownAdapters().map(adapter => {
+      const connection = adapter.missing ? "未检测到" : availability(adapter);
+      const ipv4 = adapter.addresses.filter(address => !address.includes(":"));
+      const isRouted = routed.has(adapter.id);
+      const usage = adapter.loopback ? "自动使用" : `<input type="checkbox" data-project-adapter="${esc(adapter.id)}"
+        aria-label="本项目使用 ${esc(adapter.name)}" ${selected.has(adapter.id) ? "checked" : ""}
+        ${isRouted ? 'disabled title="请先移除或更换使用此网卡的网段规则"' : ""}>`;
+      return `<tr><td>${usage}</td><td>${esc(adapter.name)}</td>
+        <td>${esc(ipv4.join(" / ") || "—")}</td>
+        <td>${badge(connection, connection === "可用" ? "good" : "warn")}</td>
+        <td>${adapter.loopback ? "回环目标自动使用" : adapter.id === fallback ? "默认网卡" : isRouted ? "网段规则" : ""}</td></tr>`;
+    });
+    const focusedId = adapterTable.contains(document.activeElement) ? document.activeElement.dataset.projectAdapter : null;
+    adapterTable.innerHTML = table(["本项目使用", "本机网卡", "本机 IPv4 地址", "连接状态", "用途"], rows.join(""), "尚未查到可用网卡");
+    if (focusedId)
+      [...adapterTable.querySelectorAll("[data-project-adapter]")].find(input => input.dataset.projectAdapter === focusedId)?.focus();
+  }
+
+  function renderNetworkSettings() {
+    updateSelect(defaultSelect, defaultSelect.value);
+    for (const select of routeFields.querySelectorAll("select")) updateSelect(select, select.value);
+    $("udpNetworks").innerHTML = [...new Set(shownAdapters().flatMap(adapter => adapter.networks))]
+      .map(network => option(network, network)).join("");
+    renderAdapters();
+  }
+
+  async function queryAdapters() {
+    if (querying) return;
+    querying = refresh.disabled = true;
+    if (adapters === null) status.textContent = "正在查询…";
+    try {
+      const entries = await request("/udp-interfaces?includeInactive=true");
+      if (!adapterTable.isConnected || !editor.open) return;
+      if (JSON.stringify(entries) !== JSON.stringify(adapters)) {
+        adapters = entries;
+        for (const adapter of entries) lastNames.set(adapter.id, adapter.name);
+        renderNetworkSettings();
+      }
+      status.textContent = `已查询 · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+    } catch (error) {
+      status.textContent = `查询失败 · ${error.message}`;
+    } finally {
+      querying = refresh.disabled = false;
+    }
+  }
+
+  updateSelect(defaultSelect, current);
+  [...routeFields.querySelectorAll("select")].forEach((select, index) => updateSelect(select, routes[index].interfaceId));
+  renderAdapters();
+  refresh.addEventListener("click", queryAdapters);
+  showInactive.addEventListener("change", renderNetworkSettings);
+  defaultSelect.addEventListener("change", renderAdapters);
+  adapterTable.addEventListener("change", event => {
+    const id = event.target.dataset.projectAdapter;
+    if (!id) return;
+    projectSelection = true;
+    if (event.target.checked) selected.add(id);
+    else {
+      selected.delete(id);
+      if (defaultSelect.value === id) defaultSelect.value = "";
+    }
+    renderNetworkSettings();
+  });
   $("addUdpRoute").addEventListener("click", () => {
-    $("udpRoutes").insertAdjacentHTML("beforeend", routeRow());
-    $("udpRoutes").lastElementChild.querySelector('[name="network"]').focus();
+    routeFields.insertAdjacentHTML("beforeend", routeRow());
+    const row = routeFields.lastElementChild;
+    updateSelect(row.querySelector("select"), "");
+    row.querySelector('[name="network"]').focus();
   });
-  $("udpRoutes").addEventListener("click", event => {
-    event.target.closest("[data-remove-route]")?.closest("[data-udp-route]").remove();
+  routeFields.addEventListener("change", renderAdapters);
+  routeFields.addEventListener("click", event => {
+    const row = event.target.closest("[data-remove-route]")?.closest("[data-udp-route]");
+    if (row) {
+      row.remove();
+      renderAdapters();
+    }
   });
+  const refreshTimer = setInterval(queryAdapters, 3000);
+  editor.addEventListener("close", () => clearInterval(refreshTimer), { once: true });
+  return queryAdapters();
 }
 
 function renderCues() {
   const current = selected();
   if (!current) {
-    $("main").innerHTML = heading("Cue 编排", "从项目树选择或创建 Cue 列表。");
-    $("properties").innerHTML = '<span class="eyebrow">属性</span><h2>未选择 Cue</h2>';
+    const description = state.project.shows.length ? "从项目结构选择或创建 Cue 列表。" :
+      "在项目结构中新增演出，或从「工作台设置 → 工程文件」导入已有工程。";
+    $("main").innerHTML = heading("Cue 编排", description);
+    renderProperties();
     return;
   }
   const { show, group, list } = current;
@@ -487,7 +656,7 @@ function selectedRun() {
 }
 
 function isStopping(run) {
-  return run.stopping || state.stoppingAll || state.stoppingRuns.has(run.id);
+  return run.stopping || state.stoppingAll || state.stoppingLists.has(run.listId);
 }
 
 function updateCountdown() {
@@ -512,11 +681,12 @@ function updateTransport() {
   const stopping = !!active && isStopping(active);
   const stopSelected = $("main").querySelector('[data-action="stop-selected"]');
   if (stopSelected) {
-    stopSelected.disabled = !active || stopping;
+    stopSelected.disabled = state.stoppingAll || state.stoppingLists.has(state.listId);
     stopSelected.textContent = stopping ? "正在停止…" : "■ 停止调度";
     $("main").querySelector('[data-action="run"]').disabled =
       !selected()?.list.cues.length || state.stoppingAll || (!!active && (active.source !== "schedule" || stopping));
     const playbackStatus = $("playbackStatus");
+    playbackStatus.classList.toggle("running", !!active && !stopping);
     let label = "待播放";
     if (active) {
       const round = active.playbackMode === "loop" && active.round ? `第 ${active.round} 轮 · ` : "";
@@ -528,7 +698,7 @@ function updateTransport() {
       row.classList.toggle("playing", active?.cueId === row.dataset.cueRow);
     });
   }
-  $("stop").disabled = state.stoppingAll || !state.runs.some(run => !run.stopping);
+  $("stop").disabled = state.stoppingAll || !state.access.role;
   $("stop").textContent = state.stoppingAll ? "正在停止…" : "■ 停止全部调度";
   $("active").classList.toggle("running", state.runs.length > 0);
   $("active").textContent = state.runs.length ? `${state.runs.length} 个列表运行中` : "引擎待命";
@@ -541,7 +711,7 @@ function updateTransport() {
     const run = state.runs.findLast(entry => entry.listId === item.dataset.id);
     item.disabled = item.dataset.action === "tree-play"
       ? item.dataset.empty === "true" || state.stoppingAll || (!!run && (run.source !== "schedule" || isStopping(run)))
-      : !run || isStopping(run);
+      : state.stoppingAll || state.stoppingLists.has(item.dataset.id);
   });
   updateCountdown();
 }
@@ -563,9 +733,9 @@ function field(label, name, value, { type = "text", choices, wide = false, requi
 
 function renderProperties() {
   const cue = selectedCue();
-  const top = '<span class="eyebrow">Cue 属性 / 当前条目</span><h2>指令配置</h2>';
   if (!cue) {
-    $("properties").innerHTML = top + '<p class="empty">选择一条 Cue 查看属性。</p>';
+    $("properties").innerHTML = '<p class="empty">选择一条 Cue 查看属性。</p>';
+    updateCueConfirmation();
     return;
   }
   const commands = targets(cue);
@@ -589,7 +759,7 @@ function renderProperties() {
       field("允许自动重试", "allowRetry", command.allowRetry == null ? "" : String(command.allowRetry),
         { wide: true, choices: [["", "沿用模板（无模板时禁用）"], ["true", "允许重复执行"], ["false", "禁止自动重试"]] }) +
       field("回执模式", "responseMode", response.mode, { choices: [["inherit", "沿用命令模板"], ...Object.entries(replyModes)] }) +
-      (!["none", "inherit"].includes(response.mode) ? field("预期 UDP 回执", "responseText", response.text, { wide: true }) +
+      (!["none", "inherit"].includes(response.mode) ? wireTextField("预期 UDP 回执", "responseText", response.text, { wide: true }) +
         (response.mode === "hex" ? "" : field("String 回执编码", "responseEncoding", response.encoding ?? "utf8", { choices: stringEncodings })) +
         field("回执超时 (ms)", "responseTimeout", response.timeoutMs, { type: "number", min: 100, max: 30000 }) : "") +
       `</div><p class="property-help">${command.nodeOverrides?.length ?? 0} 个节点例外</p>` +
@@ -597,7 +767,7 @@ function renderProperties() {
       button("恢复目标组继承", "reset-target-inheritance", index, "quiet") + "</section>";
   }).join("");
   const canAdd = choices.some(group => group.nodes.length && !commands.some(command => command.ipGroupId === group.id));
-  $("properties").innerHTML = top + '<div id="cueForm"><div class="property-form">' +
+  $("properties").innerHTML = '<div id="cueForm"><div class="property-form">' +
     field("Cue 名称", "name", cue.name, { wide: true, required: true }) +
     field("完成后等待 (s)", "delayAfterSeconds", cue.delayAfterMs == null ? "" : cue.delayAfterMs / 1000, {
       ...playbackSecondsInput, wide: true, placeholder: "留空沿用列表默认间隔"
@@ -608,8 +778,9 @@ function renderProperties() {
     field("失败策略", "onFail", cue.onFail, { choices: Object.entries(policies) }) +
     (cue.onFail === "retry" ? field("重试次数", "retries", cue.retries, { type: "number", min: 0, max: 5 }) : "") +
     '</div></div><p class="property-help">各目标组的指令可单独设置回执。ICMP Ping 检查设备可达性。重试仅用于已明确允许重复执行的未确认命令。</p><div class="actions">' +
-    button("执行预览", "dispatch-preview", cue.id, "strong") + button("移除 Cue", "delete-cue", cue.id, "quiet") + "</div>" +
-    '<div id="effectiveSettings" class="property-help">正在解析生效设置…</div>';
+    button("执行预览", "dispatch-preview", cue.id) + button("移除 Cue", "delete-cue", cue.id, "quiet") +
+    '</div><div id="effectiveSettings" class="property-help">正在解析生效设置…</div>';
+  updateCueConfirmation();
   queueEffectiveSettings();
   if (state.access.role !== "admin")
     $("properties").querySelectorAll("input, select, textarea").forEach(input => { input.disabled = true; });
@@ -659,9 +830,17 @@ function renderResource() {
     button("移除", "delete-resource", item.id, "quiet");
   let content;
   if (kind === "pads") {
-    content = '<div class="pads">' + entries.map(item => `<article class="pad">
-      <button type="button" class="fire${item.action === "stopAll" || item.action === "stopScene" ? " stop-pad" : ""}" data-action="fire-pad" data-id="${esc(item.id)}">${item.action === "stopAll" || item.action === "stopScene" ? "■" : "▶"} ${esc(item.name)}</button>
-      <p>${item.action === "stopAll" ? "停止全部调度" : (item.action === "stopScene" ? "停止现场 · " : "") + esc(listLabel(item.listId))}</p>${item.action === "play" && item.stopAction ? `<button type="button" class="fire stop-pad" data-action="pad-stop" data-id="${esc(item.id)}">■ ${item.stopAction === "scene" ? "停止现场" : "停止调度"}</button>` : ""}<div class="actions">${edit(item)}</div></article>`).join("") +
+    const boundLists = new Set(lists().filter(row => row.list.stopListId).map(row => row.list.id));
+    const unavailable = ' disabled title="请在目标列表中绑定现场停止流程"';
+    content = '<div class="pads">' + entries.map(item => {
+      const bound = boundLists.has(item.listId);
+      const stopping = item.action === "stopAll" || item.action === "stopScene";
+      return `<article class="pad">
+        <button type="button" class="fire${stopping ? " stop-pad" : ""}" data-action="fire-pad" data-id="${esc(item.id)}"${item.action === "stopScene" && !bound ? unavailable : ""}>${stopping ? "■" : "▶"} ${esc(item.name)}</button>
+        <p>${item.action === "stopAll" ? "停止全部调度" : (item.action === "stopScene" ? "停止现场 · " : "") + esc(listLabel(item.listId))}</p>
+        ${item.action === "play" && item.stopAction ? `<button type="button" class="fire stop-pad" data-action="pad-stop" data-id="${esc(item.id)}"${item.stopAction === "scene" && !bound ? unavailable : ""}>■ ${item.stopAction === "scene" ? "停止现场" : "停止调度"}</button>` : ""}
+        <div class="actions">${edit(item)}</div></article>`;
+    }).join("") +
       (entries.length ? "" : '<p class="empty">还没有 Action Pad 按钮。</p>') + "</div>";
   } else if (kind === "ips") {
     content = table(["分组", "节点数", "地址", "操作"], entries.map(item =>
@@ -688,6 +867,9 @@ function renderResource() {
 
 function healthRows() {
   const map = new Map();
+  for (const node of state.project.nodeLibrary ?? []) {
+    map.set(node.ip, { ip: node.ip, labels: node.label ? [node.label] : [], groups: [], configured: !!node.healthQuery });
+  }
   state.project.ipGroups.forEach(group => group.nodes.forEach(node => {
     if (!map.has(node.ip)) map.set(node.ip, { ip: node.ip, labels: [], groups: [], configured: false });
     const row = map.get(node.ip);
@@ -704,7 +886,8 @@ function visibleNodes() {
   const { search, group, status } = state.filters;
   return healthRows().filter(row =>
     (!search || (row.ip + " " + row.labels.join(" ")).toLowerCase().includes(search.toLowerCase())) &&
-    (!group || row.groups.some(item => item.id === group)) && (!status || row.status === status));
+    (!group || (group === "__ungrouped__" ? row.groups.length === 0 : row.groups.some(item => item.id === group))) &&
+    (!status || row.status === status));
 }
 
 function localTime(value) {
@@ -715,7 +898,7 @@ function renderHealthRows() {
   const page = pageView(visibleNodes(), state.healthPage, state.healthPageSize);
   state.healthPage = page.current;
   const rows = page.items.map(row => `<tr><td class="mono">${esc(row.ip)}</td><td>${esc(row.labels.join(" / ") || "—")}</td>
-    <td>${esc(row.groups.map(group => group.name).join(" / "))}</td><td>${badge(healthLabels[row.status], row.status === "online" ? "good" : row.status === "offline" ? "bad" : "")}</td>
+    <td>${esc(row.groups.map(group => group.name).join(" / ") || "未分组")}</td><td>${badge(healthLabels[row.status], row.status === "online" ? "good" : row.status === "offline" ? "bad" : "")}</td>
     <td>${badge(softwareLabels[row.softwareStatus], row.softwareStatus === "online" ? "good" : row.softwareStatus === "unconfirmed" ? "warn" : "")}</td>
     <td class="mono">${row.latencyMs == null ? "—" : `${row.latencyMs} ms`}</td><td class="mono">${esc(localTime(row.checkedAt))}</td>
     <td class="receipt-cell">${row.latestReceipt ? `<code>${esc(row.latestReceipt.text)}</code><br><span class="dim">HEX ${esc(row.latestReceipt.hex)}<br>${esc(row.latestReceipt.ip)}:${row.latestReceipt.sourcePort} → ${esc(row.latestReceipt.localIp)}:${row.latestReceipt.localPort}<br>${esc(localTime(row.latestReceipt.at))} · ${esc(({matched:"匹配回执",mismatch:"内容不匹配",unsolicited:"主动或未关联回传"})[row.latestReceipt.disposition])}</span>` : "—"}</td></tr>`).join("");
@@ -759,7 +942,7 @@ function renderHealth() {
     button("导出 CSV", "export-health")) +
     `<p id="healthProgress" class="schedule-mode" role="status"></p><div class="stats" id="healthStats"></div>
       <div class="filters"><input aria-label="搜索 IP 或节点" id="healthSearch" type="search" placeholder="搜索 IP 或节点" value="${esc(state.filters.search)}">
-      <select aria-label="筛选分组" id="healthGroup">${option("", "全部分组")}${state.project.ipGroups.map(group => option(group.id, group.name, state.filters.group)).join("")}</select>
+      <select aria-label="筛选分组" id="healthGroup">${option("", "全部分组")}${option("__ungrouped__", "未分组", state.filters.group)}${state.project.ipGroups.map(group => option(group.id, group.name, state.filters.group)).join("")}</select>
       <select aria-label="筛选状态" id="healthStatus">${option("", "全部状态")}${Object.entries(healthLabels).map(([key, name]) => option(key, name, state.filters.status)).join("")}</select></div>
       <div id="healthTable"></div><div id="healthPager" class="pager"></div>`;
   renderHealthProgress();
@@ -768,7 +951,7 @@ function renderHealth() {
 
 function exportHealth() {
   const rows = [["IP 地址", "节点", "分组", "设备状态", "软件状态", "Ping 延迟 (ms)", "最后检测时间", "最近回传文本", "最近回传HEX", "回传来源端口", "回传时间"], ...visibleNodes().map(row =>
-    [row.ip, row.labels.join(" / "), row.groups.map(group => group.name).join(" / "),
+    [row.ip, row.labels.join(" / "), row.groups.map(group => group.name).join(" / ") || "未分组",
       healthLabels[row.status], softwareLabels[row.softwareStatus], row.latencyMs ?? "", localTime(row.checkedAt), row.latestReceipt?.text ?? "", row.latestReceipt?.hex ?? "", row.latestReceipt?.sourcePort ?? "", localTime(row.latestReceipt?.at)])];
   downloadCsv("节点状态.csv", rows);
 }
@@ -785,7 +968,7 @@ async function showProjectFiles() {
   const backups = await request("/project/history");
   if (state.access.role !== "admin" || $("editor").open) return;
   edit("工程文件", '<div class="actions">' + button("导出已保存工程", "project-export", "", "strong") +
-    button("导入配置", "project-import", "", "quiet") + '</div><p class="property-help">配置可带到另一台电脑。导入后请核对 UDP 网卡并保存。</p>' +
+    button("导入配置", "project-import", "", "quiet") + '</div><p class="property-help">配置可带到另一台电脑。导入确认后生效，请核对目标与 UDP 网卡。</p>' +
     '<h3>历史版本</h3>' + table(["工程", "保存时间", "操作"], backups.map(item =>
       `<tr><td>${esc(item.name)} · ${item.revision}</td><td>${esc(localTime(item.savedAt))}</td><td>${button("恢复", "project-restore", item.id, "quiet")}</td></tr>`).join(""), "暂无可恢复版本"), () => {}, null, false);
   $("editor").querySelector('button[type="submit"]').textContent = "关闭";
@@ -803,16 +986,19 @@ async function importProjectConfiguration(file) {
   let configuration;
   try { configuration = JSON.parse(await file.text()); }
   catch { throw new Error("请选择有效的工程配置 JSON。"); }
+  const revision = state.revision;
   const project = await request("/project/configuration", "POST", configuration);
   if (state.access.role !== "admin") return;
-  if (state.dirty && !await confirmDialog("导入会替换当前未保存的草稿。继续吗？")) return;
+  if (state.saving || state.dirty) throw new Error("请先完成当前编辑。");
+  const enabled = project.schedules.filter(task => task.enabled).length;
+  const scheduleNote = enabled ? "此配置含 " + enabled + " 项已启用定时任务，导入后将按配置调度。" : "";
+  if (!await confirmDialog("导入此配置并替换当前工程？请核对目标地址和网卡。" + scheduleNote)) return;
+  if (state.saving || state.dirty || state.revision !== revision) throw new Error("工程已更改，请重新导入。");
   state.project = project;
   linkNodes();
   state.health = [];
+  await persistProject();
   $("editor").close();
-  dirty();
-  render();
-  notice("配置已导入草稿。请核对 UDP 网卡，然后保存项目。");
 }
 
 async function restoreProject(id) {
@@ -844,13 +1030,11 @@ async function importIpLibrary(file) {
   form.set("library", JSON.stringify(project.nodeLibrary ?? []));
   try {
     const groups = await request("/ip-library/import", "POST", form);
-    if ($("editor").open || state.project !== project || JSON.stringify(project.ipGroups) !== original)
+    if (state.saving || state.dirty || $("editor").open || state.project !== project || JSON.stringify(project.ipGroups) !== original)
       throw new Error("导入期间 IP 分组库已更改。请重新选择文件导入。");
     project.ipGroups = groups;
     linkNodes(true);
-    dirty();
-    render();
-    notice("已合并到工程草稿，核对后点击保存项目。");
+    await persistProject();
   } finally {
     state.importingIps = false;
     if (state.tab === "ips") {
@@ -873,6 +1057,7 @@ async function exportIpLibrary(format) {
 }
 
 function edit(title, fields, submit, remove, markDirty = true) {
+  if (markDirty && (state.dirty || state.saving)) throw new Error("请先完成当前修改。");
   $("fields").oninput = null;
   $("editor").classList.remove("wide-editor");
   $("editForm").querySelector('[type="submit"]').textContent = "应用";
@@ -925,8 +1110,8 @@ function editResource(id) {
   const initial = field("名称", "name", item?.name, { required: true });
   let fields = initial;
   if (kind === "ips") {
-    fields += field("节点（每行 IP, 名称, 模拟：ok / pingFail / timeout）", "nodes",
-      item?.nodes.map(node => [node.ip, node.label, node.simulation].join(", ")).join("\n"), { type: "textarea" });
+    fields += field("节点（每行 IP, 名称）", "nodes",
+      item?.nodes.map(node => [node.ip, node.label].join(", ")).join("\n"), { type: "textarea" });
   } else if (kind === "templates") {
     fields += field("数据类型", "dataType", item?.encoding === "hex" ? "hex" : "string", { choices: [["string", "String 文本"], ["hex", "HEX 原始字节"]] }) +
       '<div id="templateTextEncoding"' + (item?.encoding === "hex" ? ' hidden' : '') + '>' +
@@ -953,11 +1138,11 @@ function editResource(id) {
     const next = { id: item?.id ?? ids(), name: requiredName(data) };
     if (kind === "ips") {
       next.nodes = data.get("nodes").split(/\r?\n/).filter(line => line.trim()).map(line => {
-        const [ip, label = "", simulation = "ok", ...extra] = line.split(",").map(value => value.trim());
-        if (!ip || extra.length || !["ok", "pingFail", "timeout"].includes(simulation))
-          throw new Error("节点格式为 IP, 名称, 模拟。模拟值可省略。");
+        const [ip, label = "", ...extra] = line.split(",").map(value => value.trim());
+        if (!ip || extra.length)
+          throw new Error("节点格式为 IP, 名称。");
         const previous = state.project.nodeLibrary?.find(node => node.ip === ip);
-        return previous ?? { ip, label, simulation, healthQuery: null };
+        return previous ?? { ip, label, healthQuery: null };
       });
     } else if (kind === "templates") {
       Object.assign(next, { payload: data.get("payload"), encoding: data.get("dataType") === "hex" ? "hex" : data.get("encoding") });
@@ -972,6 +1157,9 @@ function editResource(id) {
         if (next.action === "stopAll") next.listId = "";
       }
       if (next.action !== "stopAll" && !next.listId) throw new Error("请选择目标 Cue 列表。");
+      if (kind === "pads" && (next.action === "stopScene" || next.stopAction === "scene") &&
+          !lists().find(row => row.list.id === next.listId)?.list.stopListId)
+        throw new Error("请先在目标列表设置中绑定现场停止流程。");
       if (kind === "schedules") {
         const mode = data.get("mode");
         const days = mode === "weekly" ? data.getAll("day").map(Number) : null;
@@ -1070,13 +1258,13 @@ function sharedRunNoteLocal(owner, stop) {
 }
 
 async function stopScene(id, endpoint = "/stop-scene/" + id) {
-  if (state.dirty) throw new Error("请先保存工程，再执行现场停止。");
+  if (state.dirty) throw new Error("请先确认或取消 Cue 修改，再执行现场停止。");
   const owner = lists().find(row => row.list.id === id)?.list;
   const stop = lists().find(row => row.list.id === owner?.stopListId)?.list;
   if (!stop) throw new Error("请在列表设置中绑定现场停止流程。");
   const revision = state.revision;
   const latest = await request("/project");
-  if (state.dirty) throw new Error("请先保存工程，再执行现场停止。");
+  if (state.dirty) throw new Error("请先确认或取消 Cue 修改，再执行现场停止。");
   if (latest.revision !== revision || state.revision !== revision) {
     await load();
     throw new Error("工程已在其他窗口更新，页面已刷新。请核对停止目标后重新确认。");
@@ -1118,8 +1306,7 @@ async function deleteResource(id) {
     throw new Error("该资源仍被 Cue 引用。");
   if (await confirmDialog(`移除「${item.name}」？`)) {
     entries.splice(entries.indexOf(item), 1);
-    dirty();
-    render();
+    await persistProject();
   }
 }
 
@@ -1128,9 +1315,9 @@ function editNodeSettings(ip, group = null) {
   const defaults = single ?? {};
   const query = defaults.healthQuery;
   const setting = (key, label, value, options = {}) =>
-    field("修改此项", "apply-" + key, !!single, { type: "checkbox" }) + field(label, key, value, options);
+    field("修改此项", "apply-" + key, false, { type: "checkbox" }) + field(label, key, value, options);
   const fields = (single ? `<p class="property-help">${esc(single.ip)}，设置同步到所有所属组。</p>` + field("节点名称", "nodeLabel", single.label) +
-    field("保护此节点免受批量修改", "protectNode", true, { type: "checkbox" }) :
+    field("保护此节点免受批量修改", "protectNode", single.customized, { type: "checkbox" }) :
     field("IP 范围或地址（每行一个，留空为全部节点）", "scope", group?.nodes.map(node => node.ip).join("\n") ?? "", { type: "textarea", placeholder: "192.168.1.10-192.168.1.30" }) +
     field("覆盖已单独设置的节点", "overwriteCustom", false, { type: "checkbox" })) +
     setting("targetPort", "默认目标端口（留空表示未设置）", defaults.communication?.targetPort ?? "", { type: "number", min: 1, max: 65535 }) +
@@ -1140,13 +1327,13 @@ function editNodeSettings(ip, group = null) {
     setting("receiveEncoding", "主动上报 String 显示编码", defaults.communication?.receiveEncoding ?? "utf8", { choices: stringEncodings }) +
     '<p class="property-help">固定端口统一监听，同一 IP 的命令与软件查询排队执行。回执源端口指对方发回数据所用的端口。</p>' +
     setting("pingEnabled", "网络 ICMP Ping", defaults.pingEnabled !== false, { type: "checkbox" }) +
-    field("修改软件健康查询", "apply-health", !!single, { type: "checkbox" }) +
+    field("修改软件健康查询", "apply-health", false, { type: "checkbox" }) +
     field("启用 UDP 软件心跳（独立于网络 Ping）", "healthEnabled", !!query, { type: "checkbox" }) +
     field("查询目标端口", "queryPort", query?.port ?? 7000, { type: "number", min: 1, max: 65535 }) +
     field("查询数据类型 / 编码", "queryEncoding", query?.encoding ?? "utf8", { choices: packetEncodings }) +
-    field("查询指令", "queryPayload", query?.payload ?? "ping", { type: "textarea" }) +
-    field("查询回执匹配", "queryMatch", query?.match ?? "exact", { choices: Object.entries(replyModes).filter(([mode]) => mode !== "none") }) +
-    field("查询预期回执", "queryReply", query?.reply ?? "IMOK") +
+    wireTextField("查询指令", "queryPayload", query?.payload ?? "ping") +
+    field("查询回执匹配", "queryMatch", query?.match ?? "exactStrict", { choices: Object.entries(replyModes).filter(([mode]) => mode !== "none") }) +
+    wireTextField("查询预期回执", "queryReply", query?.reply ?? "IMOK") +
     field("String 查询回执编码", "queryReplyEncoding", query?.replyEncoding ?? "utf8", { choices: stringEncodings }) +
     field("查询超时 (ms)", "queryTimeout", query?.timeoutMs ?? 800, { type: "number", min: 100, max: 30000 }) +
     '<div id="nodeBatchPreview" class="wide"></div>';
@@ -1168,7 +1355,7 @@ function editNodeSettings(ip, group = null) {
     const label = single ? data.get("nodeLabel").trim() : null;
     if (label?.length > 80) throw new Error("节点名称不能超过 80 个字符。");
     if (keys.includes("health") && data.has("healthEnabled")) {
-      const port = readPort(data, "queryPort"), payload = data.get("queryPayload");
+      const port = readPort(data, "queryPort"), payload = readWireText(data.get("queryPayload"));
       const policy = readReply(new Map([["mode", data.get("queryMatch")], ["text", data.get("queryReply")], ["timeoutMs", data.get("queryTimeout")], ["encoding", data.get("queryReplyEncoding")]]));
       if (!port || !payload?.trim()) throw new Error("启用心跳时请填写查询端口和指令。");
       healthQuery = { port, payload, reply: policy.text, match: policy.mode, timeoutMs: policy.timeoutMs,
@@ -1190,7 +1377,14 @@ function editNodeSettings(ip, group = null) {
         table(["IP", "结果"], selected.map(node => `<tr><td>${esc(node.ip)}</td><td>${!selectedIps.has(node.ip) ? "保留单独设置" : keys.length ? "将修改 " + keys.map(key => ({ targetPort: "目标端口", senderPort: "发送端口", receiverPort: "接收端口", replySourcePort: "回执源端口", receiveEncoding: "接收编码", pingEnabled: "网络检测", health: "软件查询" })[key]).join(" / ") : "尚未勾选字段"}</td></tr>`).join(""));
     } catch (error) { $("nodeBatchPreview").textContent = error.message; }
   };
-  $("fields").oninput = preview;
+  $("fields").oninput = event => {
+    if (single) {
+      const name = event.target.name;
+      const apply = $("editForm").elements["apply-" + (name.startsWith("query") || name === "healthEnabled" ? "health" : name)];
+      if (apply) apply.checked = true;
+    }
+    preview();
+  };
   preview();
 }
 
@@ -1265,7 +1459,8 @@ async function run(path, revision = state.revision) {
 
 async function runChecked(path, revision) {
   if (state.stoppingAll) throw new Error("正在停止全部播放。");
-  if (state.dirty) throw new Error("先保存项目，再执行当前配置。");
+  if (state.saving) throw new Error("请等待改动生效后再执行。");
+  if (state.dirty) throw new Error("请先确认或取消 Cue 修改，再执行。");
   if (revision !== state.revision) throw new Error("工程已更新，请重新核对并确认执行。");
   let result;
   try { result = await request(path + (path.includes("?") ? "&" : "?") + "revision=" + revision, "POST"); }
@@ -1279,22 +1474,22 @@ async function runChecked(path, revision) {
   await poll();
 }
 
-async function stopRun(active) {
-  if (!active || isStopping(active)) return;
-  state.stoppingRuns.add(active.id);
+async function stopList(listId) {
+  if (!listId || state.stoppingAll || state.stoppingLists.has(listId)) return;
+  state.stoppingLists.add(listId);
   updateTransport();
   try {
-    const result = await request("/stop/" + active.id, "POST");
+    const result = await request("/stop-list/" + encodeURIComponent(listId), "POST");
     notice(result.stopped ? "已请求停止本次平台调度。" : "本次调度已经结束。");
     await poll();
   } finally {
-    state.stoppingRuns.delete(active.id);
+    state.stoppingLists.delete(listId);
     updateTransport();
   }
 }
 
 async function stopAll() {
-  if (state.stoppingAll || !state.runs.length) return;
+  if (state.stoppingAll) return;
   state.stoppingAll = true;
   updateTransport();
   try {
@@ -1384,12 +1579,14 @@ async function act(action, id, target) {
   } else if (action === "add-cue") {
     const group = project.ipGroups.find(item => item.nodes.length);
     if (!group) throw new Error("请先在 IP 分组库添加至少一个节点。");
-    const cue = { id: ids(), name: "新 Cue", ipGroupId: group.id, templateId: null, payload: "SCENE START",
+    const cue = { id: ids(), name: "新 Cue", ipGroupId: group.id, templateId: null, payload: "",
       encoding: "utf8", port: null, ping: false, reply: "IMOK", timeoutMs: 1800, onFail: "stop", retries: 0,
       response: { mode: "inherit" }, allowRetry: null };
     current.list.cues.push(cue);
     state.cueId = cue.id;
     dirty();
+    render();
+    return;
   } else if (action === "add-target" || action === "remove-target") {
     const cue = selectedCue();
     const commands = targets(cue);
@@ -1409,6 +1606,8 @@ async function act(action, id, target) {
       else cue.additionalTargets.splice(index - 1, 1);
     }
     dirty();
+    render();
+    return;
   } else if (action === "delete-cue") {
     const index = current.list.cues.findIndex(cue => cue.id === id);
     if (!await confirmDialog(`移除「${current.list.cues[index].name}」？`)) return;
@@ -1427,9 +1626,9 @@ async function act(action, id, target) {
   else if (action === "delete-resource") return deleteResource(id);
   else if (action === "run" || action === "tree-play") return run("/run/" + id);
   else if (action === "stop-selected") {
-    return stopRun(state.runs.findLast(run => run.listId === id));
+    return stopList(id);
   }
-  else if (action === "pad-stop") { const pad = project.pads.find(item => item.id === id); if (pad?.stopAction === "scene") return stopScene(pad.listId); return stopRun(state.runs.findLast(run => run.listId === pad?.listId)); }
+  else if (action === "pad-stop") { const pad = project.pads.find(item => item.id === id); if (pad?.stopAction === "scene") return stopScene(pad.listId); return stopList(pad?.listId); }
   else if (action === "stop-scene") return stopScene(id);
   else if (action === "fire-pad") {
     const pad = project.pads.find(pad => pad.id === id);
@@ -1446,6 +1645,8 @@ async function act(action, id, target) {
     target.response = { mode: "inherit" };
     target.allowRetry = null;
     dirty();
+    render();
+    return;
   }
   else if (action === "delete-node") {
     if (project.ipGroups.some(group => group.nodes.some(node => node.ip === id)))
@@ -1460,7 +1661,7 @@ async function act(action, id, target) {
   else if (action === "edit-health-interval") {
     return edit("节点检测间隔", field("间隔（秒，0 为手动检测）", "seconds", project.healthPollSeconds ?? 0,
       { type: "number", min: 0, max: 3600, required: true }) +
-      '<p class="property-help">设为 5–3600 秒后保存工程，后台会在上一轮完成后等候该间隔再检测。设置为 0 时使用「刷新状态」。</p>',
+      '<p class="property-help">设为 5–3600 秒并确认后，后台会在上一轮完成后等候该间隔再检测。设置为 0 时使用「刷新状态」。</p>',
       data => {
         const seconds = Number(data.get("seconds"));
         if (!Number.isInteger(seconds) || (seconds !== 0 && (seconds < 5 || seconds > 3600)))
@@ -1469,7 +1670,7 @@ async function act(action, id, target) {
       });
   }
   else if (action === "refresh-health") {
-    if (state.dirty) throw new Error("先保存项目，再检测已配置节点。");
+    if (state.dirty) throw new Error("请先确认或取消 Cue 修改，再检测节点。");
     target.disabled = true;
     try {
       state.health = await request("/health/refresh", "POST");
@@ -1487,15 +1688,13 @@ async function act(action, id, target) {
     $("editor").close();
     dirty();
   }
-  render();
+  if (state.dirty) await persistProject();
+  else render();
 }
 
 async function load() {
   const data = await request("/project");
-  state.project = data.project;
-  linkNodes();
-  state.revision = data.revision;
-  state.dirty = false;
+  acceptProject(data);
   [state.health, state.layout] = await Promise.all([request("/health"), request("/layout")]);
   if (Array.isArray(state.layout)) state.layout = { order: state.layout, sizes: {} };
   render();
@@ -1505,7 +1704,8 @@ async function poll() {
   const version = ++statusRequest;
   let data;
   try {
-    data = await request(state.logVersion ? "/status?logVersion=" + encodeURIComponent(state.logVersion) : "/status");
+    const url = state.logVersion ? "/status?logVersion=" + encodeURIComponent(state.logVersion) : "/status";
+    data = await request(url, "GET", undefined, AbortSignal.timeout(5000));
   } catch (error) {
     if (version === statusRequest) {
       state.countdowns.clear();
@@ -1519,7 +1719,7 @@ async function poll() {
     applyAccess(data.access);
     if (changed && data.access.role) await load();
     if (version !== statusRequest) return;
-    $("lockStatus").textContent = `引擎继续运行 · ${data.activeCount ?? 0} 个列表 · ${data.live ? "真实 UDP" : "模拟模式"}`;
+    $("lockStatus").textContent = `引擎继续运行 · ${data.activeCount ?? 0} 个列表 · 现场运行`;
   }
   $("projectRecovery").hidden = !data.projectRecovery;
   state.scheduleStatus = data.scheduleStatus;
@@ -1543,8 +1743,8 @@ async function poll() {
   syncHealthScan(data.healthScan ?? null, data.receiptVersion ?? 0);
   $("logStorageWarning").hidden = !data.logStorageWarning;
   updateScheduleMode();
-  $("mode").classList.toggle("live", data.live);
-  $("mode").innerHTML = data.live ? "<i></i>真实 UDP" : "<i></i>模拟模式";
+  $("mode").classList.add("live");
+  $("mode").innerHTML = "<i></i>现场运行";
   updateTransport();
   state.logVersion = data.logVersion ?? null;
   state.logMaxRows = data.logMaxRows ?? state.logMaxRows;
@@ -1571,13 +1771,23 @@ document.addEventListener("click", async event => {
   if (!state.project || !state.access.role || (!tab && !trigger)) return;
   try {
     if (tab) {
+      if (state.saving || state.dirty) throw new Error("请先完成当前修改。");
       state.tab = tab.dataset.tab;
       if (state.tab === "health") state.health = await request("/health");
       render();
     } else {
       event.preventDefault();
       if (adminActions.has(trigger.dataset.action) && state.access.role !== "admin") return;
-      await act(trigger.dataset.action, trigger.dataset.id, trigger);
+      const action = trigger.dataset.action;
+      if (action === "cue-apply") { if (state.dirty && !state.saving) await persistProject({ retainDraft: true }); return; }
+      if (action === "cue-discard") { if (!state.saving) discardProjectEdit(); return; }
+      const stopsAll = action === "fire-pad" && state.project.pads.some(pad => pad.id === trigger.dataset.id && pad.action === "stopAll");
+      const canInterrupt = stopsAll || ["stop-selected", "pad-stop"].includes(action);
+      if (state.saving && !canInterrupt)
+        throw new Error("正在应用设置，请稍候。");
+      if (state.dirty && !canInterrupt && !["dispatch-preview", "add-target", "remove-target", "reset-target-inheritance"].includes(action))
+        throw new Error("请先确认或取消当前修改。");
+      await act(action, trigger.dataset.id, trigger);
     }
   } catch (error) { notice(error.message, true); }
 });
@@ -1585,6 +1795,7 @@ document.addEventListener("click", async event => {
 document.addEventListener("input", event => {
   const target = event.target;
   if (target.closest("#cueForm")) {
+    if (state.saving) return;
     const cue = selectedCue();
     if (target.name === "delayAfterSeconds") {
       cue.delayAfterMs = target.value === "" ? null : Math.round(target.valueAsNumber * 1000);
@@ -1602,7 +1813,7 @@ document.addEventListener("input", event => {
     if (groupCard && ["responseMode", "responseText", "responseTimeout", "responseEncoding"].includes(target.name)) {
       const response = { ...responseFor(cue, entry) };
       if (target.name === "responseMode") response.mode = target.value;
-      else if (target.name === "responseText") response.text = target.value;
+      else if (target.name === "responseText") response.text = readWireText(target.value);
       else if (target.name === "responseEncoding") response.encoding = target.value;
       else response.timeoutMs = target.valueAsNumber || 0;
       entry.response = response;
@@ -1646,7 +1857,7 @@ document.addEventListener("change", event => {
 });
 
 $("addShow").addEventListener("click", () => {
-  if (!state.project) return;
+  if (!state.project || state.saving || state.dirty) return;
   named("新增演出", "", name => {
     state.project.shows.push({ id: ids(), name, groups: [] });
     if (!$("projectSearch").value.trim()) state.treePage = Math.ceil(state.project.shows.length / 8);
@@ -1665,8 +1876,9 @@ $("treePager").addEventListener("click", event => {
   renderTree();
   updateTransport();
 });
-$("closeEditor").addEventListener("click", () => $("editor").close());
-$("cancelEdit").addEventListener("click", () => $("editor").close());
+$("closeEditor").addEventListener("click", () => { if (!state.saving) $("editor").close(); });
+$("cancelEdit").addEventListener("click", () => { if (!state.saving) $("editor").close(); });
+$("editor").addEventListener("cancel", event => { if (state.saving) event.preventDefault(); });
 $("projectFiles").addEventListener("click", () => showProjectFiles().catch(error => notice(error.message, true)));
 $("projectImportFile").addEventListener("change", async event => {
   const file = event.target.files[0];
@@ -1678,28 +1890,23 @@ $("projectImportFile").addEventListener("change", async event => {
 $("editForm").addEventListener("submit", async event => {
   event.preventDefault();
   const submit = event.target.querySelector('[type="submit"]');
+  if (submit.disabled || state.saving) return;
   submit.disabled = true;
+  const changesProject = state.editorMarksDirty;
   try {
-    const markDirty = state.editorMarksDirty;
     await state.editor(new FormData(event.target));
+    if (changesProject) {
+      try { await persistProject(); }
+      catch (error) {
+        $("editor").close();
+        notice(error.message, true);
+        return;
+      }
+    }
     $("editor").close();
     $("fields").replaceChildren();
-    if (markDirty) { dirty(); render(); }
   } catch (error) { $("formError").textContent = error.message; }
   finally { submit.disabled = false; }
-});
-$("save").addEventListener("click", async () => {
-  state.saving = true;
-  const counter = state.editCounter;
-  updateSave();
-  try {
-    const data = await request("/project", "PUT", { revision: state.revision, project: state.project });
-    state.revision = data.revision;
-    state.dirty = state.editCounter !== counter;
-    if (!state.dirty) { state.project = data.project; linkNodes(); render(); }
-    notice("项目已保存。");
-  } catch (error) { notice(error.message, true); }
-  finally { state.saving = false; updateSave(); }
 });
 $("reload").addEventListener("click", async () => {
   if (state.saving) return;
@@ -1767,7 +1974,7 @@ $("udpAdapter").addEventListener("click", async () => {
 });
 $("lock").addEventListener("click", async () => {
   try {
-    if (state.dirty || state.saving) throw new Error("请先保存或重新载入工程，再锁屏。");
+    if (state.dirty || state.saving) throw new Error("请先确认或取消当前修改，再锁屏。");
     if (!state.access.configured) editPermissions(true);
     else await lockAccess();
   } catch (error) { notice(error.message, true); }
@@ -1787,6 +1994,21 @@ $("unlockForm").addEventListener("submit", async event => {
   finally { submit.disabled = false; }
 });
 $("resetLayout").addEventListener("click", () => saveLayout(defaultLayout));
+const settings = $("workbenchSettings");
+document.addEventListener("click", event => {
+  if (!settings.open) return;
+  if (!settings.contains(event.target)) settings.open = false;
+  else if (event.target.closest(".settings-menu button")) {
+    settings.open = false;
+    if (!document.querySelector("dialog[open]")) settings.querySelector("summary").focus();
+  }
+});
+settings.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || !settings.open) return;
+  event.preventDefault();
+  settings.open = false;
+  settings.querySelector("summary").focus();
+});
 const panelGrid = $("panelGrid");
 for (const panel of panelGrid.children) {
   for (const [edge, label] of [["left", "左"], ["right", "右"], ["top", "上"], ["bottom", "下"]]) {
@@ -1801,13 +2023,14 @@ for (const panel of panelGrid.children) {
 }
 let resizeGesture = null;
 panelGrid.addEventListener("pointerdown", event => {
-  const handle = event.target.closest(".panel-resizer, .panel-edge");
+  const handle = event.target.closest(".panel-edge");
   if (!handle || event.button !== 0 || state.access.role !== "admin" || state.layoutSaving || resizeGesture) return;
   event.preventDefault();
   const panel = handle.closest("[data-panel]");
   handle.setPointerCapture(event.pointerId);
+  handle.classList.add("is-resizing");
   resizeGesture = { context: resizeContext(panel, handle.dataset.edge),
-    x: event.clientX, y: event.clientY, pointerId: event.pointerId, preview: null };
+    x: event.clientX, y: event.clientY, pointerId: event.pointerId, handle, preview: null };
 });
 panelGrid.addEventListener("pointermove", event => {
   const gesture = resizeGesture;
@@ -1822,6 +2045,7 @@ function finishResize(event) {
   const gesture = resizeGesture;
   if (gesture?.pointerId !== event.pointerId) return;
   resizeGesture = null;
+  gesture.handle.classList.remove("is-resizing");
   if (event.type === "pointerup" && gesture.preview) saveLayout(gesture.preview);
   else applyLayout();
 }
@@ -1848,7 +2072,7 @@ panelGrid.addEventListener("drop", event => {
 });
 panelGrid.addEventListener("dragend", () => panelGrid.querySelector(".dock-hover")?.classList.remove("dock-hover"));
 panelGrid.addEventListener("keydown", async event => {
-  if (event.target.matches(".panel-resizer, .panel-edge") && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+  if (event.target.matches(".panel-edge") && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
     const panel = event.target.closest("[data-panel]");
     const edge = event.target.dataset.edge;
     const dx = event.key === "ArrowLeft" ? -20 : event.key === "ArrowRight" ? 20 : 0;
@@ -1867,7 +2091,7 @@ panelGrid.addEventListener("keydown", async event => {
   handle.focus();
 });
 window.addEventListener("beforeunload", event => {
-  if (state.dirty) { event.preventDefault(); event.returnValue = ""; }
+  if (state.dirty || state.saving) { event.preventDefault(); event.returnValue = ""; }
 });
 
 const localClock = $("localClock");
@@ -1888,9 +2112,26 @@ async function start() {
     if (state.access.role) await load();
     await poll();
   } catch (error) { notice(error.message, true); }
-  setInterval(() => poll().catch(() => {
-    $("mode").textContent = "连接中断";
-  }), 950);
-  setInterval(updateCountdown, 100);
+  let polling = false;
+  let timer;
+  async function refreshStatus() {
+    if (polling) return;
+    clearTimeout(timer);
+    polling = true;
+    try { await poll(); }
+    catch {
+      $("mode").classList.remove("live");
+      $("mode").textContent = "连接中断";
+      $("lockStatus").textContent = "灯控引擎连接中断，正在等待恢复。";
+    } finally {
+      polling = false;
+      timer = setTimeout(refreshStatus, document.hidden ? 5000 : 950);
+    }
+  }
+  timer = setTimeout(refreshStatus, 950);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void refreshStatus();
+  });
+  setInterval(() => { if (!document.hidden) updateCountdown(); }, 100);
 }
 start();

@@ -82,8 +82,9 @@ internal static class DispatchPlan
     {
         if (allowInherit && response.Mode == "inherit") return;
         if (response.Mode == "none") return;
-        if (response.Mode is not ("exact" or "contains" or "hex") || response.TimeoutMs is < 100 or > 30000 ||
-            string.IsNullOrWhiteSpace(response.Text) || response.Text.Length > 120)
+        if (response.Mode is not ("exact" or "exactStrict" or "contains" or "hex") || response.TimeoutMs is < 100 or > 30000 ||
+            response.Text is not { Length: > 0 and <= 120 } ||
+            (response.Mode != "exactStrict" && string.IsNullOrWhiteSpace(response.Text)))
             throw new ArgumentException("回执需要有效的匹配方式、内容和 100–30000 ms 超时。");
         if (response.Mode == "hex") _ = ProjectRules.Packet(response.Text, "hex");
         else _ = ProjectRules.Packet(response.Text, response.Encoding);
@@ -95,7 +96,12 @@ internal static class DispatchPlan
         try
         {
             var text = ProjectRules.TextEncoding(response.Encoding).GetString(bytes);
-            return response.Mode == "contains" ? text.Contains(response.Text!, StringComparison.Ordinal) : text.Trim() == response.Text!.Trim();
+            return response.Mode switch
+            {
+                "contains" => text.Contains(response.Text!, StringComparison.Ordinal),
+                "exactStrict" => string.Equals(text, response.Text, StringComparison.Ordinal),
+                _ => string.Equals(text.Trim(), response.Text!.Trim(), StringComparison.Ordinal)
+            };
         }
         catch (DecoderFallbackException) { return false; }
     }

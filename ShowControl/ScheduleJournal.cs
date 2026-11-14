@@ -14,9 +14,9 @@ internal sealed class ScheduleJournal
     private string? error;
     private volatile bool unreadable;
 
-    public ScheduleJournal(string directory, bool live)
+    public ScheduleJournal(string directory)
     {
-        path = Path.Combine(directory, live ? "schedule-live.json" : "schedule-simulation.json");
+        path = Path.Combine(directory, "schedule-live.json");
         if (!File.Exists(path)) return;
         byte[]? bytes = null;
         try

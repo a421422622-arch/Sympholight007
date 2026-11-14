@@ -8,10 +8,15 @@ namespace ShowControl;
 
 internal sealed record Project(string Name, Show[] Shows, IpGroup[] IpGroups, CommandTemplate[] Templates,
     Schedule[] Schedules, PadButton[] Pads, string? UdpInterfaceId = null, UdpRoute[]? UdpRoutes = null,
-    int HealthPollSeconds = 0, Node[]? NodeLibrary = null, int AdapterWaitSeconds = 15)
+    int HealthPollSeconds = 0, Node[]? NodeLibrary = null, int AdapterWaitSeconds = 15,
+    string[]? UdpProjectInterfaceIds = null)
 {
     [JsonIgnore]
     public IEnumerable<CueList> Lists => Shows.SelectMany(show => show.Groups).SelectMany(group => group.Lists);
+
+    [JsonIgnore]
+    public IEnumerable<string> SelectedUdpInterfaces => UdpProjectInterfaceIds ??
+        (UdpRoutes ?? []).Select(route => route.InterfaceId).Prepend(UdpInterfaceId).OfType<string>().Distinct();
 }
 internal sealed record UdpRoute(string Network, string InterfaceId);
 internal sealed record Show(string Id, string Name, ShowGroup[] Groups);
@@ -40,7 +45,7 @@ internal sealed record CueTarget(string IpGroupId, string? TemplateId, string Pa
 internal sealed record NodeCommandOverride(string Ip, string? TemplateId = null, int? Port = null, ReplyPolicy? Response = null);
 internal sealed record ReplyPolicy(string Mode, string? Text = null, int TimeoutMs = 1800, string Encoding = "utf8");
 internal sealed record IpGroup(string Id, string Name, Node[] Nodes);
-internal sealed record Node(string Ip, string Label, string Simulation, HealthQuery? HealthQuery = null,
+internal sealed record Node(string Ip, string Label, HealthQuery? HealthQuery = null,
     NodeCommunication? Communication = null, bool PingEnabled = true, bool Customized = false);
 internal sealed record NodeCommunication(int? TargetPort = null, int SenderPort = 0, int? ReceiverPort = null,
     int? ReplySourcePort = null, string ReceiveEncoding = "utf8");
@@ -87,6 +92,19 @@ internal static class ProjectRules
             if (!networks.Add(UdpNetwork.ParseSubnet(route.Network)))
                 throw new ArgumentException($"UDP 目标网段「{route.Network}」已配置。");
         }
+        if (project.UdpProjectInterfaceIds is { } interfaceIds)
+        {
+            var selected = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var interfaceId in interfaceIds)
+            {
+                CheckAdapter(interfaceId);
+                if (!selected.Add(interfaceId))
+                    throw new ArgumentException("本项目使用的 UDP 网卡包含重复项。");
+            }
+            if ((project.UdpInterfaceId is { } defaultId && !selected.Contains(defaultId)) ||
+                routes.Any(route => !selected.Contains(route.InterfaceId)))
+                throw new ArgumentException("默认发送网卡和目标网段的网卡须勾选「本项目使用」。");
+        }
         Limit(project.Shows, 50);
         Limit(project.IpGroups, 100);
         Limit(project.Templates, 100);
@@ -110,8 +128,7 @@ internal static class ProjectRules
             foreach (var node in group.Nodes)
             {
                 var address = ParseIp(node.Ip);
-                if (node.Label is null || node.Label.Length > 80 || !seen.Add(address) ||
-                    node.Simulation is not ("ok" or "pingFail" or "timeout"))
+                if (node.Label is null || node.Label.Length > 80 || !seen.Add(address))
                     throw new ArgumentException($"IP 分组「{group.Name}」包含重复节点或无效配置。");
                 if (node.Communication is { } communication &&
                     (communication.TargetPort is < 1 or > 65535 || communication.SenderPort is < 0 or > 65535 ||
@@ -120,11 +137,10 @@ internal static class ProjectRules
                 if (node.Communication is { } settings) _ = TextEncoding(settings.ReceiveEncoding);
                 if (node.HealthQuery is { } query)
                 {
-                    if (query.Port is < 1 or > 65535 || string.IsNullOrWhiteSpace(query.Reply) || query.Reply.Length > 120)
+                    if (query.Port is < 1 or > 65535 || query.Match == "none")
                         throw new ArgumentException($"节点「{node.Ip}」的健康查询端口或回执无效。");
                     _ = Packet(query.Payload, query.Encoding);
                     DispatchPlan.CheckResponse(new(query.Match, query.Reply, query.TimeoutMs, query.ReplyEncoding));
-                    if (query.Match == "none") throw new ArgumentException("软件健康查询需要匹配回执。");
                     if (queries.TryGetValue(address, out var previous) && previous != query)
                         throw new ArgumentException($"节点「{node.Ip}」在多个分组中的健康查询设置不一致。");
                     queries[address] = query;
@@ -331,7 +347,7 @@ internal sealed class ProjectStore : IDisposable
         {
             if (!File.Exists(path) && !Directory.Exists(history))
             {
-                snapshot = new(1, DispatchPlan.Normalize(Demo()));
+                snapshot = new(1, new Project("新工程", [], [], [], [], [], NodeLibrary: []));
                 SaveFile(path, snapshot);
                 return;
             }
@@ -359,6 +375,17 @@ internal sealed class ProjectStore : IDisposable
             return snapshot;
     }
 
+    public bool WhileCurrent(Snapshot expected, Action action)
+    {
+        lock (gate)
+        {
+            if (recovery || !ReferenceEquals(snapshot, expected))
+                return false;
+            action();
+            return true;
+        }
+    }
+
     public Snapshot? Save(Snapshot edit)
     {
         if (edit.Project is null)
@@ -369,11 +396,32 @@ internal sealed class ProjectStore : IDisposable
         {
             if (edit.Revision != snapshot.Revision)
                 return null;
+            CheckPadStopBindings(edit.Project, snapshot.Project);
             var next = new Snapshot(NextRevision(snapshot.Revision), edit.Project);
             Commit(next);
             snapshot = next;
             recovery = false;
             return next;
+        }
+    }
+
+    private static void CheckPadStopBindings(Project project, Project previous)
+    {
+        var lists = project.Lists.ToDictionary(list => list.Id);
+        var previousLists = previous.Lists.ToDictionary(list => list.Id);
+        var previousPads = previous.Pads.ToDictionary(pad => pad.Id);
+        foreach (var pad in project.Pads)
+        {
+            if (pad.Action != "stopScene" && (pad.Action != "play" || pad.StopAction != "scene"))
+                continue;
+            if (lists[pad.ListId].StopListId is not null)
+                continue;
+            // 已有无绑定按钮可以随旧工程加载，新增或改绑时必须指定停止流程。
+            if (previousPads.TryGetValue(pad.Id, out var old) && old.ListId == pad.ListId &&
+                old.Action == pad.Action && old.StopAction == pad.StopAction &&
+                previousLists.TryGetValue(pad.ListId, out var oldList) && oldList.StopListId is null)
+                continue;
+            throw new ArgumentException($"Action Pad「{pad.Name}」的目标列表需要绑定现场停止流程。");
         }
     }
 
@@ -467,31 +515,5 @@ internal sealed class ProjectStore : IDisposable
             if (File.Exists(temp))
                 File.Delete(temp);
         }
-    }
-
-    private static Project Demo()
-    {
-        var shows = new[] { ("daily", "日常"), ("national", "国庆"), ("moon", "中秋"), ("default", "默认") }
-            .Select(show => new Show(show.Item1, show.Item2,
-                new[] { ("facade", "立面"), ("podium", "裙楼"), ("indoor", "室内") }.Select(group =>
-                {
-                    var id = show.Item1 + "-" + group.Item1;
-                    return new ShowGroup(id, group.Item2, [
-                        new(id + "-main", group.Item2 + " · 主播放", [
-                            new(id + "-01", "启动画面", "ip-" + group.Item1, "tpl-start", "", "utf8", 7000, true, "IMOK", 1800, "retry", 1),
-                            new(id + "-02", "切换主场景", "ip-" + group.Item1, null, "SCENE MAIN", "utf8", 7000, false, "IMOK", 1800, "skip", 0),
-                            new(id + "-03", "退出场景", "ip-" + group.Item1, "tpl-stop", "", "utf8", 7000, false, "IMOK", 1800, "stop", 0)
-                        ])
-                    ]);
-                }).ToArray())).ToArray();
-        return new("城市光影 · 控制项目", shows,
-            [
-                new("ip-facade", "立面控制节点", [new("192.0.2.11", "立面主节点", "ok"), new("192.0.2.12", "立面备节点", "ok")]),
-                new("ip-podium", "裙楼控制节点", [new("192.0.2.21", "裙楼主节点", "ok")]),
-                new("ip-indoor", "室内控制节点", [new("192.0.2.31", "室内主节点", "pingFail")])
-            ],
-            [new("tpl-start", "启动场景", "SCENE START", "utf8"), new("tpl-stop", "停止场景", "SCENE STOP", "utf8")],
-            [new("daily-open", "日常开场", "daily-facade-main", "19:00", false)],
-            [new("pad-open", "立面主播放", "daily-facade-main"), new("pad-podium", "裙楼主播放", "daily-podium-main")]);
     }
 }
